@@ -349,6 +349,12 @@ int on_addr_resolved(struct rdma_cm_id *id) {
     int ret;
     log_debug("address resolved.");
 
+    if (!id->verbs) {
+        log_err("addr resolved but no RDMA device found for this path -- "
+                "check RoCE v2 mode: echo \"RoCE v2\" > "
+                "/sys/kernel/config/rdma_cm/mlx5_0/ports/1/default_roce_mode");
+        return -1;
+    }
     build_connection_client(id);
     ret = rdma_resolve_route(id, TIMEOUT_IN_MS);
     assertz(ret);
@@ -414,11 +420,17 @@ void rcntrl_connect(struct rcntrl_conn_t *rrc) {
     // initiate connection
     while (rdma_get_cm_event(rrc->rchannel, &event) == 0) {
         struct rdma_cm_event event_copy;
+        int r;
 
         memcpy(&event_copy, event, sizeof(*event));
         rdma_ack_cm_event(event);
 
-        if (on_event(&event_copy)) break;
+        r = on_event(&event_copy);
+        if (r < 0) {
+            log_err("rcntrl_connect: on_event failed, aborting");
+            exit(EXIT_FAILURE);
+        }
+        if (r) break;
     }
 
     log_info("client connected!");
