@@ -35,7 +35,8 @@
 
 #define RDMA_SERVER_NSLABS (RDMA_SERVER_MEMORY_GB * 1073741824L / RMEM_SLAB_SIZE)
 
-static struct context *s_ctx = NULL;
+static struct context *s_ctx = NULL; /* server-side RDMA context (app clients) */
+static struct context *c_ctx = NULL; /* client-side RDMA context (rcntrl connection) */
 static volatile bool aborted = false;
 
 struct rcntrl_conn_t;
@@ -281,39 +282,35 @@ void register_memory_client(struct connection *conn) {
     conn->send_msg = xmalloc(sizeof(struct message));
     conn->recv_msg = xmalloc(sizeof(struct message));
 
-    conn->send_mr = ibv_reg_mr(s_ctx->pd, conn->send_msg, 
+    conn->send_mr = ibv_reg_mr(c_ctx->pd, conn->send_msg,
         sizeof(struct message), IBV_ACCESS_LOCAL_WRITE);
     assert(conn->send_mr);
 
-    conn->recv_mr = ibv_reg_mr(s_ctx->pd, conn->recv_msg, 
+    conn->recv_mr = ibv_reg_mr(c_ctx->pd, conn->recv_msg,
         sizeof(struct message), IBV_ACCESS_LOCAL_WRITE);
     assert(conn->recv_mr);
 }
 
 void build_context_client(struct ibv_context *verbs) {
-    if (s_ctx) {
-        assert(s_ctx->ctx == verbs);
+    if (c_ctx) {
+        assert(c_ctx->ctx == verbs);
         return;
     }
 
-    s_ctx = (struct context *)xmalloc(sizeof(struct context));
-    s_ctx->ctx = verbs;
-    s_ctx->pd = ibv_alloc_pd(s_ctx->ctx);
-    assert(s_ctx->pd);
-     s_ctx->comp_channel = ibv_create_comp_channel(s_ctx->ctx);
-    assert(s_ctx->comp_channel);
-       s_ctx->cq = ibv_create_cq(s_ctx->ctx, 10, NULL, s_ctx->comp_channel, 0); /* cqe=10 is arbitrary*/
-    assert(s_ctx->cq);
-
-    //int ret = pthread_create(&s_ctx->cq_poller_thread, NULL, poll_cq, NULL);
-    //assertz(ret);
+    c_ctx = (struct context *)xmalloc(sizeof(struct context));
+    c_ctx->ctx = verbs;
+    c_ctx->pd = ibv_alloc_pd(c_ctx->ctx);
+    assert(c_ctx->pd);
+    c_ctx->comp_channel = NULL;
+    c_ctx->cq = ibv_create_cq(c_ctx->ctx, 10, NULL, NULL, 0);
+    assert(c_ctx->cq);
 }
 
 void build_qp_attr_client(struct ibv_qp_init_attr *qp_attr) {
     memset(qp_attr, 0, sizeof(*qp_attr));
 
-    qp_attr->send_cq = s_ctx->cq;
-    qp_attr->recv_cq = s_ctx->cq;
+    qp_attr->send_cq = c_ctx->cq;
+    qp_attr->recv_cq = c_ctx->cq;
     qp_attr->qp_type = IBV_QPT_RC;
 
     qp_attr->cap.max_send_wr = 10;
@@ -330,9 +327,7 @@ void build_connection_client(struct rdma_cm_id *id) {
     build_context_client(id->verbs);
     build_qp_attr_client(&qp_attr);
 
-    log_info("rdma_create_qp: id->verbs=%p s_ctx->ctx=%p s_ctx->pd=%p s_ctx->pd->context=%p",
-             (void*)id->verbs, (void*)s_ctx->ctx, (void*)s_ctx->pd, (void*)s_ctx->pd->context);
-    ret = rdma_create_qp(id, s_ctx->pd, &qp_attr);
+    ret = rdma_create_qp(id, c_ctx->pd, &qp_attr);
     if (ret) { log_err("rdma_create_qp failed: ret=%d errno=%s", ret, strerror(errno)); exit(EXIT_FAILURE); }
     if (!id->qp) { log_err("rdma_create_qp succeeded but id->qp is NULL"); exit(EXIT_FAILURE); }
 
@@ -345,8 +340,6 @@ void build_connection_client(struct rdma_cm_id *id) {
     conn->connected = 0;
 
     register_memory_client(conn);
-    log_info("build_connection_client: qp=%p recv_mr=%p send_mr=%p",
-             conn->qp, conn->recv_mr, conn->send_mr);
     post_receives(conn);
 }
 
@@ -443,7 +436,7 @@ void rcntrl_connect(struct rcntrl_conn_t *rrc) {
 
 void rcntrl_create(struct rcntrl_conn_t *rrc) {
     char portstr[10];
-    struct addrinfo *addr = NULL, *src_addr = NULL;
+    struct addrinfo *addr = NULL;
     int ret;
 
     sprintf(portstr, "%d", rrc->port);
@@ -451,19 +444,13 @@ void rcntrl_create(struct rcntrl_conn_t *rrc) {
     ret = getaddrinfo(rrc->ip, portstr, NULL, &addr);
     assertz(ret);
 
-    /* Resolve local server IP explicitly so RDMA CM picks the same device
-     * as the server listener (avoids multi-port device mismatch). */
-    ret = getaddrinfo(globals.server, NULL, NULL, &src_addr);
-    if (ret) { log_err("getaddrinfo src failed: %s", gai_strerror(ret)); exit(EXIT_FAILURE); }
-
     rrc->rchannel = rdma_create_event_channel();
     if (!rrc->rchannel) { log_err("rdma_create_event_channel failed: %s", strerror(errno)); exit(EXIT_FAILURE); }
     ret = rdma_create_id(rrc->rchannel, &(rrc->rid), NULL, RDMA_PS_TCP);
     if (ret) { log_err("rdma_create_id failed: %s", strerror(errno)); exit(EXIT_FAILURE); }
-    ret = rdma_resolve_addr(rrc->rid, src_addr->ai_addr, addr->ai_addr, TIMEOUT_IN_MS);
+    ret = rdma_resolve_addr(rrc->rid, NULL, addr->ai_addr, TIMEOUT_IN_MS);
     if (ret) { log_err("rdma_resolve_addr failed: %s", strerror(errno)); exit(EXIT_FAILURE); }
 
-    freeaddrinfo(src_addr);
     freeaddrinfo(addr);
 }
 
