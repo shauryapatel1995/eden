@@ -112,12 +112,6 @@ if [[ $DPDK ]]; then
     # patch -p 1 -d dpdk/ < mlx4_18_11.patch
     # sed -i 's/CONFIG_RTE_LIBRTE_MLX4_PMD=n/CONFIG_RTE_LIBRTE_MLX4_PMD=y/g' dpdk/config/common_base
 
-    # Add MLNX OFED paths so meson finds libibverbs/libmlx5 for the mlx5 PMD
-    if [ -d /opt/mellanox ]; then
-        export PKG_CONFIG_PATH=/opt/mellanox/dpdk/lib/x86_64-linux-gnu/pkgconfig:/opt/mellanox/iproute2/lib/pkgconfig:${PKG_CONFIG_PATH}
-        export LD_LIBRARY_PATH=/opt/mellanox/dpdk/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
-    fi
-
     # Build dpdk
     pushd ${DPDK_DIR}
     if [ "$DPDK_BUILD_TYPE" == "make" ]; then
@@ -146,10 +140,18 @@ if [[ $DPDK ]]; then
 
     elif [ "$DPDK_BUILD_TYPE" == "meson" ]; then
         if [[ $FORCE ]]; then   rm -rf build;   fi
+        # Add MLNX OFED to pkg-config path only for meson configure so it
+        # detects libibverbs/libmlx5 and compiles the mlx5 PMD
+        SAVED_PKG_CONFIG_PATH=${PKG_CONFIG_PATH}
+        if [ -d /opt/mellanox ]; then
+            export PKG_CONFIG_PATH=/opt/mellanox/dpdk/lib/x86_64-linux-gnu/pkgconfig:/opt/mellanox/iproute2/lib/pkgconfig:${PKG_CONFIG_PATH}
+        fi
         meson build
         ninja -C build
         sudo ninja -C build install
-        libs=$(pkg-config  --static --libs libdpdk)
+        # Reset so pkg-config finds OUR installed DPDK 20.11, not MLNX OFED's newer version
+        export PKG_CONFIG_PATH=${SAVED_PKG_CONFIG_PATH}
+        libs=$(pkg-config --static --libs libdpdk)
         if [ -z "$libs" ]; then
             echo "ERROR! pkg-config returned empty string for libdpdk"
             exit 1
