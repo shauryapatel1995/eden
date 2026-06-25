@@ -331,7 +331,8 @@ void build_connection_client(struct rdma_cm_id *id) {
     build_qp_attr_client(&qp_attr);
 
     ret = rdma_create_qp(id, s_ctx->pd, &qp_attr);
-    assertz(ret);
+    if (ret) { log_err("rdma_create_qp failed: ret=%d errno=%s", ret, strerror(errno)); exit(EXIT_FAILURE); }
+    if (!id->qp) { log_err("rdma_create_qp succeeded but id->qp is NULL"); exit(EXIT_FAILURE); }
 
     id->context = conn = (struct connection *)xmalloc(sizeof(struct connection));
 
@@ -342,6 +343,8 @@ void build_connection_client(struct rdma_cm_id *id) {
     conn->connected = 0;
 
     register_memory_client(conn);
+    log_info("build_connection_client: qp=%p recv_mr=%p send_mr=%p",
+             conn->qp, conn->recv_mr, conn->send_mr);
     post_receives(conn);
 }
 
