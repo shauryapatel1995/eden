@@ -401,9 +401,18 @@ int on_event(struct rdma_cm_event *event) {
         r = on_connection_client(event->id);
     else if (event->event == RDMA_CM_EVENT_DISCONNECTED)
         r = on_disconnect_client(event->id);
-    else {
-        log_err("on_event: %d status: %d\n", event->event, event->status);
-        log_err("Unknown event: is server running?");
+    else if (event->event == RDMA_CM_EVENT_REJECTED) {
+        log_err("rcntrl rejected connection (status=%d) -- is rcntrl running? restart it to clear stale CM state",
+                event->status);
+        r = -1;
+    } else if (event->event == RDMA_CM_EVENT_CONNECT_ERROR ||
+               event->event == RDMA_CM_EVENT_UNREACHABLE ||
+               event->event == RDMA_CM_EVENT_ADDR_ERROR ||
+               event->event == RDMA_CM_EVENT_ROUTE_ERROR) {
+        log_err("rcntrl connection failed: event=%d status=%d", event->event, event->status);
+        r = -1;
+    } else {
+        log_err("on_event: unexpected event %d status: %d\n", event->event, event->status);
         BUG();
     }
 
