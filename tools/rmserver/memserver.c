@@ -358,7 +358,6 @@ int on_addr_resolved(struct rdma_cm_id *id) {
                 "/sys/kernel/config/rdma_cm/mlx5_0/ports/1/default_roce_mode");
         return -1;
     }
-    build_connection_client(id);
     ret = rdma_resolve_route(id, TIMEOUT_IN_MS);
     assertz(ret);
     return 0;
@@ -369,6 +368,7 @@ int on_route_resolved(struct rdma_cm_id *id) {
     int ret;
 
     log_debug("route resolved.\n");
+    build_connection_client(id);
     build_params(&cm_params);
     ret = rdma_connect(id, &cm_params);
     assertz(ret);
