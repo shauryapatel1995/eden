@@ -447,11 +447,11 @@ void rcntrl_create(struct rcntrl_conn_t *rrc) {
     assertz(ret);
 
     rrc->rchannel = rdma_create_event_channel();
-    assert(rrc->rchannel);
+    if (!rrc->rchannel) { log_err("rdma_create_event_channel failed: %s", strerror(errno)); exit(EXIT_FAILURE); }
     ret = rdma_create_id(rrc->rchannel, &(rrc->rid), NULL, RDMA_PS_TCP);
-    assertz(ret);
+    if (ret) { log_err("rdma_create_id failed: %s", strerror(errno)); exit(EXIT_FAILURE); }
     ret = rdma_resolve_addr(rrc->rid, NULL, addr->ai_addr, TIMEOUT_IN_MS);
-    assertz(ret);
+    if (ret) { log_err("rdma_resolve_addr failed: %s", strerror(errno)); exit(EXIT_FAILURE); }
 
     assert(addr != NULL);
     freeaddrinfo(addr);
