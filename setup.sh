@@ -24,6 +24,7 @@ case $i in
     ;;
 
     -dv=*|--dpdkver=*)
+    DPDK=1
     DPDK_VER="${i#*=}"
     ;;
 
@@ -83,15 +84,22 @@ if [[ $DPDK ]]; then
     fi
 
     # Initialize & setup DPDK
-    if [ ! -d ${DPDK_DIR} ]; then
+    # Ensure submodule is populated (handles case where dir exists but is empty)
+    if [ -z "$(ls -A ${DPDK_DIR} 2>/dev/null)" ]; then
+        echo "DPDK submodule directory is empty, initializing..."
         git submodule update --init ${DPDK_DIR}
-        if lspci | grep -q 'ConnectX-5'; then
-            echo "ConnectX-5 detected, applying mlx5 patch"
+    fi
+
+    if [ ! -f ${DPDK_DIR}/meson.build ]; then
+        rm -rf ${DPDK_DIR}/build
+        git submodule update --init ${DPDK_DIR}
+        if lspci | grep -qE 'ConnectX-[56]'; then
+            echo "Mellanox ConnectX NIC detected, applying mlx5 patch"
             echo "Make sure mlnx ofed is installed; I'm not gonna do this"
             echo "Tried and tested ofed version for this config: ${MLX_OFED}"
             echo "Use this command: sudo ./mlnxofedinstall --dpdk --upstream-libs --add-kernel-support"
         else
-            echo "This script does not support non-ConnectX-5 NICs"
+            echo "This script does not support non-Mellanox ConnectX NICs"
             exit 1
         fi
         pushd ${DPDK_DIR}
@@ -142,9 +150,8 @@ if [[ $DPDK ]]; then
         fi
         echo "$libs" > dpdk_libs
         echo "$(pkg-config --cflags libdpdk)" > dpdk_includes
-        popd
 
-    else 
+    else
         echo "Unknown DPDK build type: $DPDK_BUILD_TYPE"
         exit 1
     fi
