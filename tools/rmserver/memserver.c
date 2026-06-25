@@ -330,6 +330,8 @@ void build_connection_client(struct rdma_cm_id *id) {
     build_context_client(id->verbs);
     build_qp_attr_client(&qp_attr);
 
+    log_info("rdma_create_qp: id->verbs=%p s_ctx->ctx=%p s_ctx->pd=%p s_ctx->pd->context=%p",
+             (void*)id->verbs, (void*)s_ctx->ctx, (void*)s_ctx->pd, (void*)s_ctx->pd->context);
     ret = rdma_create_qp(id, s_ctx->pd, &qp_attr);
     if (ret) { log_err("rdma_create_qp failed: ret=%d errno=%s", ret, strerror(errno)); exit(EXIT_FAILURE); }
     if (!id->qp) { log_err("rdma_create_qp succeeded but id->qp is NULL"); exit(EXIT_FAILURE); }
