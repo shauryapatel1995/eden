@@ -112,6 +112,12 @@ if [[ $DPDK ]]; then
     # patch -p 1 -d dpdk/ < mlx4_18_11.patch
     # sed -i 's/CONFIG_RTE_LIBRTE_MLX4_PMD=n/CONFIG_RTE_LIBRTE_MLX4_PMD=y/g' dpdk/config/common_base
 
+    # Add MLNX OFED paths so meson finds libibverbs/libmlx5 for the mlx5 PMD
+    if [ -d /opt/mellanox ]; then
+        export PKG_CONFIG_PATH=/opt/mellanox/dpdk/lib/x86_64-linux-gnu/pkgconfig:/opt/mellanox/iproute2/lib/pkgconfig:${PKG_CONFIG_PATH}
+        export LD_LIBRARY_PATH=/opt/mellanox/dpdk/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+    fi
+
     # Build dpdk
     pushd ${DPDK_DIR}
     if [ "$DPDK_BUILD_TYPE" == "make" ]; then
