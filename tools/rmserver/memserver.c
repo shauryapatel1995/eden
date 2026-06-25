@@ -443,7 +443,7 @@ void rcntrl_connect(struct rcntrl_conn_t *rrc) {
 
 void rcntrl_create(struct rcntrl_conn_t *rrc) {
     char portstr[10];
-    struct addrinfo *addr = NULL;
+    struct addrinfo *addr = NULL, *src_addr = NULL;
     int ret;
 
     sprintf(portstr, "%d", rrc->port);
@@ -451,14 +451,19 @@ void rcntrl_create(struct rcntrl_conn_t *rrc) {
     ret = getaddrinfo(rrc->ip, portstr, NULL, &addr);
     assertz(ret);
 
+    /* Resolve local server IP explicitly so RDMA CM picks the same device
+     * as the server listener (avoids multi-port device mismatch). */
+    ret = getaddrinfo(globals.server, NULL, NULL, &src_addr);
+    if (ret) { log_err("getaddrinfo src failed: %s", gai_strerror(ret)); exit(EXIT_FAILURE); }
+
     rrc->rchannel = rdma_create_event_channel();
     if (!rrc->rchannel) { log_err("rdma_create_event_channel failed: %s", strerror(errno)); exit(EXIT_FAILURE); }
     ret = rdma_create_id(rrc->rchannel, &(rrc->rid), NULL, RDMA_PS_TCP);
     if (ret) { log_err("rdma_create_id failed: %s", strerror(errno)); exit(EXIT_FAILURE); }
-    ret = rdma_resolve_addr(rrc->rid, NULL, addr->ai_addr, TIMEOUT_IN_MS);
+    ret = rdma_resolve_addr(rrc->rid, src_addr->ai_addr, addr->ai_addr, TIMEOUT_IN_MS);
     if (ret) { log_err("rdma_resolve_addr failed: %s", strerror(errno)); exit(EXIT_FAILURE); }
 
-    assert(addr != NULL);
+    freeaddrinfo(src_addr);
     freeaddrinfo(addr);
 }
 
