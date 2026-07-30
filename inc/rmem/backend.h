@@ -80,7 +80,15 @@ struct rmem_backend_ops {
     int (*post_read)(int chan_id, struct fault* f);
 
     /**
-     * post_write - post write request for the page range pointed by addr and 
+     * post_read_prefetch - post read request for a speculatively prefetched
+     * page (not part of the fault's own read-ahead range). returns 0 if
+     * posted, EAGAIN if busy
+     */
+    int (*post_read_prefetch)(int chan_id, struct fault* f,
+        unsigned long addr, void *bkend_buf);
+
+    /**
+     * post_write - post write request for the page range pointed by addr and
      * size to the backend. returns 0 if posted, EAGAIN if busy
      */
     int (*post_write)(int chan_id, struct region_t* mr, unsigned long addr, 

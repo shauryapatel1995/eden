@@ -49,12 +49,16 @@ bool does_fault_exist_in_wait_q(struct fault *fault)
 /* called after fetched pages are ready on handler read completions */
 int hthr_fault_read_done(fault_t* f)
 {
-    int r;
+    int r, nevicts;
     r = fault_read_done(f);
     assertz(r);
 
-    /* release fault */
-    fault_done(f);
+    /* release fault. this path has no natural place to act on
+     * nevicts_needed (e.g. from prefetching in fault_done()), so we
+     * just assert it doesn't ask for any - eviction is handled by the
+     * caller for the fault that led here */
+    fault_done(f, my_hthr->bkend_chan_id, &nevicts);
+    assert(nevicts < 1);
     return 0;
 }
 
@@ -67,7 +71,7 @@ int hthr_fault_read_done(fault_t* f)
 /* called on the completions stolen from the shenango kthreads */
 int hthr_fault_read_steal_done(fault_t* f)
 {
-    int r;
+    int r, nevicts;
     struct kthread* owner;
 
     /* get owner kthread */
@@ -100,8 +104,10 @@ int hthr_fault_read_steal_done(fault_t* f)
     if (f->page == current_blocking_page)
         current_page_unblocked = true;
 
-    /* release fault */
-    fault_done(f);
+    /* release fault. see hthr_fault_read_done() for why we assert on
+     * nevicts here instead of acting on it */
+    fault_done(f, my_hthr->bkend_chan_id, &nevicts);
+    assert(nevicts < 1);
     return 0;
 }
 
@@ -177,6 +183,9 @@ static inline fault_t* read_uffd_fault()
     struct uffd_msg message;
     struct fault* fault;
     unsigned long long addr, flags;
+#ifdef UFFD_PC_SUPPORTED
+    unsigned long pc;
+#endif
     struct region_t* mr;
 
     struct pollfd evt = { .fd = userfault_fd, .events = POLLIN };
@@ -212,6 +221,9 @@ static inline fault_t* read_uffd_fault()
         /* new fault */
         addr = message.arg.pagefault.address;
         flags = message.arg.pagefault.flags;
+#ifdef UFFD_PC_SUPPORTED
+        pc = message.arg.pagefault.pc;
+#endif
         log_debug("uffd pagefault event %d: addr=%llx, flags=0x%llx",
             message.event, addr, flags);
 
@@ -225,6 +237,10 @@ static inline fault_t* read_uffd_fault()
         /* populate it */
         memset(fault, 0, sizeof(fault_t));
         fault->page = addr & ~CHUNK_MASK;
+        fault->faulting_addr = addr;
+#ifdef UFFD_PC_SUPPORTED
+        fault->pc = pc;
+#endif
         fault->is_wrprotect = !!(flags & UFFD_PAGEFAULT_FLAG_WP);
         fault->is_write = !!(flags & UFFD_PAGEFAULT_FLAG_WRITE);
         fault->is_read = !(fault->is_write || fault->is_wrprotect);
@@ -322,7 +338,7 @@ static void* rmem_handler(void *arg)
                     list_del_from(&my_hthr->fault_wait_q, &fault->link);
                     assert(my_hthr->n_wait_q > 0);
                     my_hthr->n_wait_q--;
-                    fault_done(fault);
+                    fault_done(fault, my_hthr->bkend_chan_id, &nevicts_needed);
                     work_done = true;
                     break;
                 case FAULT_READ_POSTED:
@@ -374,7 +390,7 @@ static void* rmem_handler(void *arg)
                 &nevicts_needed, &hthr_cbs);
             switch (fstatus) {
                 case FAULT_DONE:
-                    fault_done(fault);
+                    fault_done(fault, my_hthr->bkend_chan_id, &nevicts_needed);
                     break;
                 case FAULT_IN_PROGRESS:
                     /* handler thread should not see duplicate faults as we 

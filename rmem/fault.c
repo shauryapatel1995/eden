@@ -18,6 +18,7 @@
 #include "rmem/pgnode.h"
 #include "rmem/stats.h"
 #include "rmem/uffd.h"
+#include "rmem/prefetch.h"
 
 /* fault handling common state */
 __thread void* zero_page = NULL;
@@ -25,6 +26,41 @@ __thread char fstr[__FAULT_STR_LEN];
 
 __thread unsigned int n_wait_q;
 __thread struct list_head fault_wait_q;
+
+#ifdef DO_PREFETCH
+__thread FeatureVector features[600];
+__thread int responses[600];
+#endif
+
+/*
+ * Initialize the prefetcher and its per-thread feature buffers. Only does
+ * anything when DO_PREFETCH is enabled - a predictor backend (e.g.
+ * tools/fltrace/xgboost_prefetcher.c) must provide init_prefetcher().
+ */
+void prefetch_init(void)
+{
+#ifdef DO_PREFETCH
+    int i;
+
+    init_prefetcher();
+
+    /* pointer candidates */
+    for (i = 0; i < 512; i++) {
+        features[i].pc = 0;
+        features[i].offset = i;
+        features[i].delta = -1;
+        features[i].offset_from_faulting = 0;
+    }
+
+    /* next-N sequential candidates */
+    for (i = 512; i < 600; i++) {
+        features[i].pc = 0;
+        features[i].offset = -1;
+        features[i].delta = i;
+        features[i].offset_from_faulting = -1;
+    }
+#endif
+}
 
 /**
  * Per-thread zero page support
@@ -77,9 +113,54 @@ bool is_fault_serviced(fault_t* f, bool locked)
     return false;
 }
 
-/* checks if a page is in the same state as the faulting page to batch it 
- * together as a part of rdahead. this function only checks page flags and 
- * assumes that page locations relative to each other are already evaluated 
+/* checks whether a page is prefetchable and, if so, locks it (caller is
+ * responsible for clearing PFLAG_WORK_ONGOING once done with it) */
+bool is_page_prefetchable(fault_t *f, unsigned long addr)
+{
+    struct region_t* mr;
+    bool was_locked;
+    pgflags_t oldflags, rflags;
+
+    mr = f->mr;
+    if (!is_in_memory_region_unsafe(mr, addr))
+        return false;
+
+    rflags = get_page_flags(mr, addr);
+    /* this page hasn't been accessed by the app yet, don't prefetch it */
+    if (!(rflags & PFLAG_REGISTERED))
+        return false;
+
+    /* already present
+     * XXX: confirm if the other requirements from fault_can_rdahead()
+     * are necessary here too */
+    if (rflags & PFLAG_PRESENT)
+        return false;
+
+    if (rflags & PFLAG_WORK_ONGOING)
+        return false;
+
+    /* try locking */
+    rflags = set_page_flags(mr, addr, PFLAG_WORK_ONGOING, &oldflags);
+    was_locked = !!(oldflags & PFLAG_WORK_ONGOING);
+    if (was_locked)
+        return false;
+
+    /* check present again after locking
+     * XXX: do we need to run fault_can_rdahead() here too? */
+    if (unlikely(rflags & PFLAG_PRESENT)) {
+        /* this shouldn't happen unless there is an extreme race; someone
+         * locked the page, changed its state and released it all in
+         * between our earlier check and taking the lock */
+        clear_page_flags(mr, addr, PFLAG_WORK_ONGOING, &oldflags);
+        assert(!!(oldflags & PFLAG_WORK_ONGOING));
+        return false;
+    }
+    return true;
+}
+
+/* checks if a page is in the same state as the faulting page to batch it
+ * together as a part of rdahead. this function only checks page flags and
+ * assumes that page locations relative to each other are already evaluated
  * for read-ahead */
 bool fault_can_rdahead(pgflags_t rdahead_page, pgflags_t base_page)
 {
@@ -114,8 +195,49 @@ int __always_inline get_highest_evict_gen(void)
     return 0;
 }
 
-/* after the faulting page (and read-ahead) has been uffd-copied into the 
- * address space, we must allocate new page nodes to track them and add the 
+/* after a prefetched page has been uffd-copied into the address space, we
+ * must allocate a new page node to track it and add it to the eviction
+ * lists (same as fault_alloc_page_nodes() below, but for a single
+ * out-of-band prefetched page rather than the fault's own rdahead range) */
+static inline void prefetch_alloc_page_nodes(unsigned long addr, fault_t* f)
+{
+    int prio;
+    struct rmpage_node* pgnode;
+    struct list_head new;
+    struct page_list* evict_gen;
+    pgidx_t pgidx;
+
+    /* prio level */
+    prio = f->evict_prio;
+    assert(prio >= 0 && prio < evict_nprio);
+
+    list_head_init(&new);
+    pgnode = rmpage_node_alloc();
+    assert(pgnode);
+
+    /* each page node gets an MR reference too which gets removed
+     * when the page is evicted out */
+    __get_mr(f->mr);
+    pgnode->mr = f->mr;
+    pgnode->addr = addr;
+    pgnode->evict_prio = prio;
+    list_add_tail(&new, &pgnode->link);
+
+    pgidx = rmpage_get_node_id(pgnode);
+    pgidx = set_page_index(pgnode->mr, pgnode->addr, pgidx);
+    assertz(pgidx); /* old index must be 0 */
+
+    /* XXX: prefetched pages don't currently participate in the
+     * do-not-evict (DNE) list, unlike fault_alloc_page_nodes() below */
+    evict_gen = &evict_gens[get_highest_evict_gen()];
+    spin_lock(&evict_gen->lock);
+    list_append_list(&evict_gen->pages[prio], &new);
+    evict_gen->npages += 1;
+    spin_unlock(&evict_gen->lock);
+}
+
+/* after the faulting page (and read-ahead) has been uffd-copied into the
+ * address space, we must allocate new page nodes to track them and add the
  * nodes to the eviction lists */
 static inline void fault_alloc_page_nodes(fault_t* f)
 {
@@ -230,7 +352,36 @@ static inline void fault_serve_zero_pages(fault_t* f, int nchunks)
     RSTAT(FAULTS_ZP)++;
 }
 
-/* Called after reading the pages from the backend completed: uffd-copies the 
+/* Called after a prefetched page is read from the backend */
+int prefetch_read_done(unsigned long addr, void *bkend_buf, fault_t *f)
+{
+    int n_retries, r;
+    bool wrprotect, no_wake;
+    size_t size;
+    pgflags_t flags;
+
+    assert(bkend_buf);
+    wrprotect = true;
+    no_wake = true;
+
+    size = CHUNK_SIZE;
+    r = uffd_copy(userfault_fd, addr, (unsigned long) bkend_buf, size,
+        wrprotect, no_wake, true, &n_retries);
+    assertz(r);
+    RSTAT(UFFD_RETRIES) += n_retries;
+
+    /* set page flags */
+    flags = PFLAG_PRESENT;
+    if (!wrprotect) flags |= PFLAG_DIRTY;
+    set_page_flags_range(f->mr, addr, size, flags);
+
+    /* add page node for the prefetched page */
+    prefetch_alloc_page_nodes(addr, f);
+
+    return 0;
+}
+
+/* Called after reading the pages from the backend completed: uffd-copies the
  * page(s) into virtual memory and allocs page nodes */
 int fault_read_done(fault_t* f)
 {
@@ -263,13 +414,19 @@ int fault_read_done(fault_t* f)
     return 0;
 }
 
-/* Called after servicing fault is completely done: removes lock on the page 
+/* Called after servicing fault is completely done: removes lock on the page
  * and frees temporary resources */
-void fault_done(fault_t* f)
+void fault_done(fault_t* f, int chan_id, int *nevicts_needed)
 {
     int i, r;
     pgthread_t owner_kthr;
     pgflags_t oldflags;
+
+#ifdef DO_PREFETCH
+    /* speculatively prefetch pointer-chase candidates off the page we just
+     * finished servicing, before releasing its lock */
+    page_postfetch(f, features, responses, chan_id, nevicts_needed);
+#endif
 
     /* remove lock (in ascending order) */
     if (f->locked_pages) {
@@ -329,6 +486,7 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
         /* some other fault addressed the page, fault done */
         fault->uffd_explicit_wake = fault->from_kernel;
         log_debug("%s - fault done, was redundant", FSTR(fault));
+        RSTAT(FAULTS_REDUNDANT)++;
         return FAULT_DONE;
     }
     else {
@@ -357,10 +515,11 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
                 return FAULT_DONE;
             }
 
-            /* at this point, we can check for read-ahead. see if we can get 
-             * a lock on the next few pages that have similar requirements 
-             * as the current page so we can make the same choices for them 
+            /* at this point, we can check for read-ahead. see if we can get
+             * a lock on the next few pages that have similar requirements
+             * as the current page so we can make the same choices for them
              * throughout the fault handling */
+#ifdef DO_RDAHEAD
             for (i = 1; i <= fault->rdahead_max; i++) {
                 addr = fault->page + i * CHUNK_SIZE;
                 if(!is_in_memory_region_unsafe(mr, addr))
@@ -391,6 +550,7 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
                 nchunks++;
                 fault->rdahead++;
             }
+#endif
             if (nchunks > 1) {
                 RSTAT(RDAHEADS)++;
                 RSTAT(RDAHEAD_PAGES) += fault->rdahead;

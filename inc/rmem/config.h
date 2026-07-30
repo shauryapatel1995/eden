@@ -130,6 +130,21 @@ BUILD_ASSERT(EVICTION_MAX_BATCH_SIZE <= RMEM_MAX_CHUNKS_PER_OP);
 #define HANDLER_WAIT_BEFORE_STEAL_US    100
 BUILD_ASSERT((1 + FAULT_MAX_RDAHEAD_SIZE) <= RMEM_MAX_CHUNKS_PER_OP);
 
+/* sequential read-ahead on fault (default on, preserves existing behavior) */
+#define DO_RDAHEAD
+
+/* content-directed (pointer-chasing) prefetch after fault_done(). off by
+ * default, and NOT toggled here - it pulls in a prefetch predictor backend
+ * (e.g. tools/fltrace/xgboost_prefetcher.c) with its own build-time
+ * dependencies, so it's enabled via `make fltrace.so DO_PREFETCH=1`
+ * instead of a plain #define (see Makefile) */
+
+/* uffd fault message includes the faulting instruction pointer. requires an
+ * out-of-tree kernel patch that adds message.arg.pagefault.pc (NOT the same
+ * as kernel/uffd-include-ip.patch, which adds a different field/location) -
+ * off by default until that kernel patch lands */
+// #define UFFD_PC_SUPPORTED
+
 /* fault sampling */
 #define MAX_FAULT_SAMPLERS          (MAX_HANDLER_CORES)
 #define FAULT_TRACE_STEPS           50

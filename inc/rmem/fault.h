@@ -40,12 +40,15 @@ typedef struct fault {
 
     /* associated resources */
     unsigned long page;
+    uint64_t faulting_addr;     /* actual faulting addr (used by prefetcher) */
+    uint64_t pc;                /* faulting pc (used by prefetcher) */
     struct region_t* mr;
     thread_t* thread;
     void* bkend_buf;
     unsigned long tstamp_tsc;
 
 	struct list_node link;
+    uint8_t cacheline_padding[128 - 80]; /* pad fault_t to 2 cache lines */
 } fault_t;
 BUILD_ASSERT(sizeof(fault_t) % CACHE_LINE_SIZE == 0);
 BUILD_ASSERT(FAULT_MAX_RDAHEAD_SIZE <= UINT8_MAX);   /* due to rdahead */
@@ -71,10 +74,11 @@ static inline char* fault_to_str(fault_t* f) {
 DECLARE_PERTHREAD(struct tcache_perthread, fault_pt);
 
 /* inits */
-int fault_tcache_init(); 
+int fault_tcache_init();
 void fault_tcache_init_thread();
 bool fault_is_node_valid(struct fault* f);
 void fault_tcache_destroy(void);
+void prefetch_init(void);
 
 /* fault_alloc - allocates a fault object */
 static inline fault_t *fault_alloc(void)
@@ -114,10 +118,13 @@ enum fault_status {
     FAULT_READ_POSTED
 };
 
+bool is_page_prefetchable(fault_t *f, unsigned long addr);
+int prefetch_read_done(unsigned long addr, void *bkend_buf, fault_t *f);
+
 struct bkend_completion_cbs;
-enum fault_status handle_page_fault(int chan_id, fault_t* fault, int* nevicts, 
+enum fault_status handle_page_fault(int chan_id, fault_t* fault, int* nevicts,
     struct bkend_completion_cbs* cbs);
 int fault_read_done(fault_t* f);
-void fault_done(fault_t* fault);
+void fault_done(fault_t* fault, int chan_id, int *nevicts_needed);
 
 #endif    // __FAULT_H__

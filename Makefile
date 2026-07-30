@@ -166,12 +166,25 @@ memserver_obj = $(memserver_src:.c=.o)
 # fltrace - fault tracing library
 fltrace_src = $(wildcard tools/fltrace/*.c)
 fltrace_obj = $(fltrace_src:.c=.o)
+FLTRACE_LD = $(LD)
 ifeq ($(MAKECMDGOALS),$(FLTRACE))
 CFLAGS += -fPIC # (fltrace is a shared library)
 CFLAGS += -DREMOTE_MEMORY
 CFLAGS += -DRMEM_STANDALONE
 CFLAGS += -DKEEP_PERTHREAD_DATA
 CFLAGS += -DFAULT_SAMPLER
+
+# content-directed prefetching (opt-in: make fltrace.so DO_PREFETCH=1).
+# pulls in the XGBoost predictor backend (tools/fltrace/xgboost_prefetcher.c)
+# which needs libxgboost installed and its C++ runtime, so this is kept out
+# of fltrace.so's default build (tools/fltrace is also used as a plain
+# page-fault profiling tool with no reason to need xgboost).
+ifneq ($(DO_PREFETCH),)
+CFLAGS += -DDO_PREFETCH
+FLTRACE_LD = g++
+XGBOOST_LIBS = -L/usr/local/lib -lxgboost -Wl,-rpath=/usr/local/lib
+XGBOOST_LINK_FLAGS = -Wl,--whole-archive $(XGBOOST_LIBS) -Wl,--no-whole-archive -lstdc++
+endif
 endif
 
 tools_src = $(wildcard tools/*/*.c)
@@ -229,10 +242,11 @@ memserver: $(memserver_obj) libbase.a
 	$(LD) $(LDFLAGS) -o $@ $(memserver_obj) libbase.a -lpthread -lm $(RDMA_LIBS)
 
 # fltrace.so has to be built separately as it uses different flags
-# use "make fltrace.so"
+# use "make fltrace.so" (add DO_PREFETCH=1 to also build in xgboost)
 $(FLTRACE): $(fltrace_obj) librmem.a libbase.a base/base.ld
-	$(LD) $(CFLAGS) $(LDFLAGS) -shared $(fltrace_obj) -o $(FLTRACE)	\
-		librmem.a libbase.a $(JEMALLOC_STATIC_LIBS) -lpthread -lm -ldl 
+	$(FLTRACE_LD) $(CFLAGS) $(LDFLAGS) -shared $(fltrace_obj) -o $(FLTRACE)	\
+		librmem.a libbase.a $(JEMALLOC_STATIC_LIBS) $(XGBOOST_LINK_FLAGS)	\
+		-lpthread -lm -ldl
 #-Wl,-Map=fltrace.map
 
 ## tests

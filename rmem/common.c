@@ -109,6 +109,16 @@ int rmem_common_init(
     /* init lru lists and other eviction state */
     eviction_init();
 
+#ifdef DO_PREFETCH
+    /* content-directed prefetching is not implemented for the RDMA backend
+     * yet (rdma_backend_ops.post_read_prefetch is NULL) - fail fast instead
+     * of crashing on the first prefetch attempt */
+    BUG_ON(rmbackend_type == RMEM_BACKEND_RDMA);
+
+    /* init prefetching data structures */
+    prefetch_init();
+#endif
+
 #ifdef FAULT_SAMPLER
     /* init fault samplers */
     fsampler_init(fsampler_samples_per_sec);

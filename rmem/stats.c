@@ -15,11 +15,13 @@ const char *rstat_names[] = {
     "faults_zp",
 	"faults_p0",
     "faults_done",
+    "faults_redundant",
     "wp_upgrades",
     "uffd_notif",
     "uffd_retries",
     "rdahead_ops",
     "rdahead_pages",
+    "prefetched_pages",
 
     /* eviction stats */
     "evict_ops",
