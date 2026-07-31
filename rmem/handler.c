@@ -283,6 +283,15 @@ static void* rmem_handler(void *arg)
 {
     /* handler threads run entirely in runtime */
     preempt_disable();
+    /* also mark this thread as "runtime" for fltrace.c/stat.c's own
+     * malloc/mmap interposition (a separate, RMEM_STANDALONE-specific
+     * guard from preempt_disable() above): without this, this thread's own
+     * setup allocations (e.g. zero_page_init_thread()'s aligned_alloc())
+     * get treated as app memory and routed through jemalloc -> rmalloc(),
+     * which can deadlock waiting on this very thread to service the fault
+     * that routing creates. Never re-entered with RUNTIME_EXIT() - this
+     * thread never runs application code. */
+    RUNTIME_ENTER();
 
     bool need_eviction, work_done;
     unsigned long long pressure;

@@ -18,6 +18,21 @@
 #include "rmem/config.h"
 #include "rmem/handler.h"
 
+#ifdef RMEM_STANDALONE
+/* preempt_cnt/preempt() normally live in runtime/preempt.c, which is part
+ * of the Shenango scheduler (libruntime.a) and isn't linked into
+ * RMEM_STANDALONE builds (e.g. fltrace.so). save_stacktrace() below only
+ * needs preempt_disable()/preempt_enable()'s nesting-safe runtime-marking
+ * (see the comment there) - there's no iokernel here to ever request a
+ * preemption (nothing clears PREEMPT_NOT_PENDING), so preempt() itself is
+ * unreachable in practice but still defined to satisfy the link. */
+volatile __thread unsigned int preempt_cnt = (PREEMPT_NOT_PENDING | 1);
+void preempt(void)
+{
+    BUG();
+}
+#endif
+
 #define FAULT_TRACE_BUF_SIZE    (FAULT_TRACE_STEPS*15)
 #define MAX_FAULT_SAMPLE_LEN    1000
 #define FSAMPLER_MAX_BUFS       10000

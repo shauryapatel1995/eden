@@ -16,3 +16,7 @@ memserver
 # ignore dpdk submodule since we dynamically switch between commits
 # (any updates to these modules must be forced with -f)
 dpdk
+
+# vendored CPU-only libxgboost.so + its versioned libgomp dependency
+# (extracted from the `xgboost-cpu` PyPI wheel, not committed - large binaries)
+tools/fltrace/xgboost_cpu_lib/

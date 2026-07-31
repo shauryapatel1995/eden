@@ -22,6 +22,99 @@ being handled outside this plan by you directly.
 
 This document is a plan only — no code has been changed in this repo.
 
+## Status (updated after commit `6ee5028`, "Porting basic prefetching
+implementation from fltrace")
+
+**Done** — the LOCAL-backend port described below, plus full Shenango
+runtime integration (not just the `RMEM_STANDALONE`/`tools/fltrace` build):
+- New files: `inc/rmem/prefetch.h`, `rmem/prefetch.c`.
+- Patched files: `inc/rmem/backend.h`, `inc/rmem/stats.h`/`rmem/stats.c`,
+  `inc/rmem/fault.h`/`rmem/fault.c`, `rmem/handler.c` (**all** call sites
+  updated, including the `#ifndef RMEM_STANDALONE` Shenango-stealing path),
+  `rmem/common.c`, `rmem/rmem_local.c` (`local_post_read_prefetch` wired in).
+- Build gating: `DO_PREFETCH` is a Makefile flag (`make fltrace.so
+  DO_PREFETCH=1`), not a `config.h` `#define` — resolves the "gate behind a
+  flag?" question in the Build System section below in favor of yes.
+- `DO_RDAHEAD` is now unconditionally defined in `config.h` (always on);
+  `DO_PREFETCH` stays opt-in via the Makefile.
+
+**Deviation from plan** — `rmem/xgboost_prefetcher.c` was **not** skipped as
+originally planned. It was ported essentially as-is into
+`tools/fltrace/xgboost_prefetcher.c` (guarded by `#ifdef DO_PREFETCH`, so
+it's a no-op / doesn't pull in `libxgboost` unless that flag is set) and is
+what currently implements `init_prefetcher()`/`page_prefetch_preds()`/
+`page_postfetch_preds()`. This is being used as a working interim backend;
+the tree→C compiler swap described in "Swapping in the generated predictor"
+below has **not** happened yet — that section is still forward-looking, not
+history.
+
+**Done — LOCAL backend end-to-end test, with the `pc` kernel feature
+disabled** (`benchmarks/ll` linked-list microbenchmark, `models/random-ll-*`
+model, `make fltrace.so DO_PREFETCH=1`, run under
+`LD_PRELOAD=fltrace.so`). This required fixing several bugs found along the
+way, none specific to the prefetcher port itself:
+- `inc/rmem/common.h`: `RUNTIME_ENTER()`/`RUNTIME_EXIT()`/`IN_RUNTIME()`/
+  `NOT_IN_RUNTIME()` had been deleted from the header by commit `12d0bd5`
+  (Apr 2023) without updating `tools/fltrace/fltrace.c`/`stat.c`, which
+  still called them — restored verbatim (undefined-symbol build break,
+  present for 2+ years, never hit because `fltrace.so` was never linked).
+- `inc/runtime/preempt.h` + `rmem/fsampler.c`: `preempt_disable()`/
+  `preempt_enable()` used raw `%fs:preempt_cnt@tpoff` asm, which forces a
+  TLS model invalid in a shared object; switched to plain C. Added a
+  `RMEM_STANDALONE`-only `preempt_cnt` storage + `preempt()` stub, since the
+  real ones (`runtime/preempt.c`) belong to the Shenango scheduler and
+  aren't linked into `fltrace.so`.
+- `rmem/handler.c`: `rmem_handler()` marked itself runtime-only via
+  `preempt_disable()` but never called `RUNTIME_ENTER()` — a *separate*
+  guard that `fltrace.c`'s malloc/mmap interposition actually checks. Without
+  it, the handler thread's own setup allocation
+  (`zero_page_init_thread()`'s `aligned_alloc()`) got treated as app memory,
+  routed through jemalloc → `rmalloc()`, and deadlocked waiting on the very
+  thread that would need to service the fault that routing created.
+- The `pip install xgboost` wheel's `libxgboost.so` bundles CUDA/thrust
+  support that's triggered on the *first* prediction call
+  (`xgboost::common::AllVisibleGPUs()`) even for pure-CPU inference; on this
+  GPU-less machine something in that bundled code deadlocks on a
+  glibc-internal lock (`__exit_funcs_lock`, via a CUDA-error-category
+  static's atexit registration) and never returns. Fixed by vendoring the
+  `xgboost-cpu` PyPI wheel's `libxgboost.so` instead (no CUDA/thrust code
+  compiled in at all — confirmed via `nm`/`ldd`) under
+  `tools/fltrace/xgboost_cpu_lib/` (gitignored, not pip-installed, since
+  `xgboost-cpu` shares the `xgboost` import name and would silently replace
+  whatever's already pip-installed for other uses).
+- `tools/fltrace/xgboost_prefetcher.c`'s `XGBOOST_LIB_PATH` (the runtime
+  `dlopen()` target) was hardcoded to `/usr/local/lib/libxgboost.so` —
+  made overridable via `EDEN_PREFETCH_XGBOOST_LIB_PATH`.
+- XGBoost's OpenMP thread pool defaults to one thread per core; since
+  `prefetch.c` calls inference with `batch_size=1` hundreds of times per
+  fault, this must be capped (`OMP_NUM_THREADS=1` in the environment) or
+  each tiny prediction pays for a full thread-pool spin-up.
+
+Result: `faults_done` matched `faults` exactly (8412/8412, LOCAL backend,
+4MB local / 64MB backing memory, 4096-node linked list) — no stuck faults,
+clean exit. **`prefetched_pages` was 0** for this run — expected given `pc`
+is unavailable (always 0) without the kernel patch, so the model's real
+predictive feature is missing; this validates the pipeline mechanics (fault
+→ candidate construction → inference call → completion), not the model's
+hit rate.
+
+**Not done — the RDMA backend still has no `post_read_prefetch`.**
+Confirmed directly: `rmem/rmem_rdma.c`'s `rdma_backend_ops` struct has no
+`post_read_prefetch` initializer (defaults to `NULL`), and `rmem/common.c`
+now has an explicit guard —
+`BUG_ON(rmbackend_type == RMEM_BACKEND_RDMA)` inside the `#ifdef
+DO_PREFETCH` block in `rmem_common_init()` — so a `DO_PREFETCH` build
+configured with the RDMA backend fails fast at startup instead of crashing
+on the first prefetch. The "two things that need real design work" section
+below, item 1, is unaddressed. **This means end-to-end prefetching over
+RDMA does not run yet** — see the note at the end of this document.
+
+**Not done — the `pc` kernel patch.** `fault.h`'s `fault_t.pc`/
+`faulting_addr` fields and `handler.c`'s `read_uffd_fault()` plumbing are in
+place, but gated behind a new `UFFD_PC_SUPPORTED` flag in `config.h` that is
+left commented out (not defined) until the out-of-tree kernel patch lands.
+Item 2 of "the two things that need real design work" is still open.
+
 ## What the prefetcher does
 
 It's a **content-directed (pointer-chasing) prefetcher** driven by a binary
@@ -70,24 +163,25 @@ Eden's Shenango integration lives.
 ## File-by-file plan
 
 New files (copy in, then adapt per notes below):
-- `inc/rmem/prefetch.h` → `inc/rmem/prefetch.h` (as-is, *unless* the tree→C
+- ✅ **Done** `inc/rmem/prefetch.h` → `inc/rmem/prefetch.h` (as-is, *unless* the tree→C
   compiler's output needs a different `FeatureVector` shape — see "Swapping
   in the generated predictor" below)
-- `rmem/prefetch.c` → `rmem/prefetch.c` (as-is; only touches `is_page_prefetchable`, `prefetch_read_done`, `page_postfetch`, none of which reference Shenango or RDMA directly — they go through `rmbackend->post_read_prefetch`)
-- `rmem/xgboost_prefetcher.c` → **not ported**. Replace with a new file
-  (e.g. `rmem/tree_prefetcher.c`, or whatever the generated code's natural
-  home is) implementing the same three functions this file implemented:
-  `init_prefetcher()`, `page_prefetch_preds()`, `page_postfetch_preds()`.
-  See "Swapping in the generated predictor" below.
+- ✅ **Done** `rmem/prefetch.c` → `rmem/prefetch.c` (as-is; only touches `is_page_prefetchable`, `prefetch_read_done`, `page_postfetch`, none of which reference Shenango or RDMA directly — they go through `rmbackend->post_read_prefetch`)
+- ⚠️ **Done, but deviated from plan** `rmem/xgboost_prefetcher.c` → was
+  going to be **not ported**, replaced by a new tree→C-compiler-backed
+  file. Instead it was ported essentially as-is into
+  `tools/fltrace/xgboost_prefetcher.c` (`#ifdef DO_PREFETCH`-gated) and is
+  the backend currently in use. The tree→C swap in "Swapping in the
+  generated predictor" below has not happened.
 
 Patched files:
-- `inc/rmem/backend.h`: add the `post_read_prefetch` function pointer to `struct rmem_backend_ops` (mirrors `post_read`).
-- `inc/rmem/stats.h`, `rmem/stats.c`: add `RSTAT_FAULTS_REDUNDANT` and `RSTAT_PREFETCHES` counters + names — direct copy, no conflicts.
-- `inc/rmem/fault.h`: add `faulting_addr`, `pc` (both `uint64_t`) to `fault_t`, plus padding — **do the math against Eden's actual layout, not fltrace's** (see below). Change `fault_done()` signature to `fault_done(fault_t *fault, int chan_id, int *nevicts_needed)` and add `prefetch_init()`/`is_page_prefetchable()`/`prefetch_read_done()` declarations.
-- `rmem/fault.c`: add `prefetch_init()`, `is_page_prefetchable()`, `prefetch_alloc_page_nodes()`, `prefetch_read_done()`; extend `fault_done()` for the new signature and the `#ifdef DO_PREFETCH` call to `page_postfetch()`; extend `handle_page_fault()` with `RSTAT(FAULTS_REDUNDANT)++` and (optionally) the `#ifdef DO_RDAHEAD` gating fltrace applied to the existing read-ahead loop.
-- `rmem/handler.c`: update **every** `fault_done(f)` call site to the new 3-arg form. Eden has more call sites than fltrace because of the Shenango-stealing path (`hthr_fault_read_steal_done` etc., which don't exist in fltrace) — grep for `fault_done(` in `rmem/handler.c` and update all of them, including inside the `#ifndef RMEM_STANDALONE` block fltrace's diff never touched (because fltrace can't compile that path at all).
-- `rmem/common.c`: add the `prefetch_init()` call inside `rmem_common_init()`, after `eviction_init()` — same insertion point in both codebases.
-- `rmem/rmem_local.c`: add `local_post_read_prefetch()` and wire it into `local_backend_ops.post_read_prefetch` — direct port.
+- ✅ **Done** `inc/rmem/backend.h`: add the `post_read_prefetch` function pointer to `struct rmem_backend_ops` (mirrors `post_read`).
+- ✅ **Done** `inc/rmem/stats.h`, `rmem/stats.c`: add `RSTAT_FAULTS_REDUNDANT` and `RSTAT_PREFETCHES` counters + names — direct copy, no conflicts.
+- ✅ **Done** `inc/rmem/fault.h`: add `faulting_addr`, `pc` (both `uint64_t`) to `fault_t`, plus padding — **do the math against Eden's actual layout, not fltrace's** (see below). Change `fault_done()` signature to `fault_done(fault_t *fault, int chan_id, int *nevicts_needed)` and add `prefetch_init()`/`is_page_prefetchable()`/`prefetch_read_done()` declarations.
+- ✅ **Done** `rmem/fault.c`: add `prefetch_init()`, `is_page_prefetchable()`, `prefetch_alloc_page_nodes()`, `prefetch_read_done()`; extend `fault_done()` for the new signature and the `#ifdef DO_PREFETCH` call to `page_postfetch()`; extend `handle_page_fault()` with `RSTAT(FAULTS_REDUNDANT)++` and (optionally) the `#ifdef DO_RDAHEAD` gating fltrace applied to the existing read-ahead loop.
+- ✅ **Done** `rmem/handler.c`: update **every** `fault_done(f)` call site to the new 3-arg form. Eden has more call sites than fltrace because of the Shenango-stealing path (`hthr_fault_read_steal_done` etc., which don't exist in fltrace) — grep for `fault_done(` in `rmem/handler.c` and update all of them, including inside the `#ifndef RMEM_STANDALONE` block fltrace's diff never touched (because fltrace can't compile that path at all).
+- ✅ **Done** `rmem/common.c`: add the `prefetch_init()` call inside `rmem_common_init()`, after `eviction_init()` — same insertion point in both codebases. Also added a `BUG_ON(rmbackend_type == RMEM_BACKEND_RDMA)` guard not in the original plan (see RDMA section below).
+- ✅ **Done** `rmem/rmem_local.c`: add `local_post_read_prefetch()` and wire it into `local_backend_ops.post_read_prefetch` — direct port.
 
 ## Swapping in the generated predictor
 
@@ -127,7 +221,7 @@ Two things to pin down once the generated code's interface is decided:
 
 ## The two things that need real design work, not just copying
 
-### 1. RDMA backend has no `post_read_prefetch` at all
+### 1. RDMA backend has no `post_read_prefetch` at all — ❌ still not done
 
 fltrace never had an RDMA backend, so this function doesn't exist anywhere
 to copy from. Eden's `common.c` picks `rdma_backend_ops` for
@@ -159,7 +253,7 @@ Recommended staging:
   inline in `page_postfetch()`. This is a real structural change to
   `prefetch.c`, not a port.
 
-### 2. The `pc` feature needs a kernel patch (you're handling this directly)
+### 2. The `pc` feature needs a kernel patch (you're handling this directly) — ❌ still not done (kernel patch pending; `fault_t.pc` plumbing is in place behind the new `UFFD_PC_SUPPORTED` flag, which is currently undefined)
 
 fltrace reads `message.arg.pagefault.pc` in `handler.c`'s
 `read_uffd_fault()`. Checked directly: `/usr/include/linux/userfaultfd.h`
@@ -234,19 +328,21 @@ external dependencies:
 
 ## Suggested staging order
 
-1. Port into `tools/fltrace/` (`RMEM_STANDALONE` build via `make
+1. ✅ **Done** Port into `tools/fltrace/` (`RMEM_STANDALONE` build via `make
    fltrace.so`) first — it already calls the same `rmem_common_init()`
    entry point, has no Shenango-stealing code to reconcile, and only needs
    the LOCAL backend's `post_read_prefetch`. This validates the model
    loading, feature pipeline, and page-fault-path integration with the
    least new work, closely mirroring the source repo.
-2. Extend to the full Shenango-integrated runtime (`rmem/handler.c`'s
-   `#ifndef RMEM_STANDALONE` paths) once step 1 works.
-3. Implement `rdma_post_read_prefetch()` (blocking v1, per above) to run
+2. ✅ **Done** Extend to the full Shenango-integrated runtime (`rmem/handler.c`'s
+   `#ifndef RMEM_STANDALONE` paths) once step 1 works. (Landed in the same
+   commit as step 1, not as a separate follow-up.)
+3. ❌ **Not done** Implement `rdma_post_read_prefetch()` (blocking v1, per above) to run
    the same test across smarties06/smarties10 instead of the LOCAL
    backend — this is the real Eden deployment target this session set up
-   in `network_setup.md`.
-4. Land the kernel `pc` patch (in progress separately) and confirm
+   in `network_setup.md`. **This is the blocker for running the prefetcher
+   end-to-end over RDMA.**
+4. ❌ **Not done** Land the kernel `pc` patch (in progress separately) and confirm
    `fault.h`/`handler.c`'s `pc` plumbing compiles and populates correctly.
 
 ## Verification

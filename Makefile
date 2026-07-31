@@ -181,8 +181,25 @@ CFLAGS += -DFAULT_SAMPLER
 # page-fault profiling tool with no reason to need xgboost).
 ifneq ($(DO_PREFETCH),)
 CFLAGS += -DDO_PREFETCH
+# c_api.h isn't shipped by any xgboost pip wheel, so a copy (matching the
+# linked library's version) is vendored here instead of requiring a system
+# libxgboost-dev.
+CFLAGS += -I$(CURDIR)/tools/fltrace/xgboost_include
 FLTRACE_LD = g++
-XGBOOST_LIBS = -L/usr/local/lib -lxgboost -Wl,-rpath=/usr/local/lib
+# Use a CPU-only libxgboost.so (vendored under tools/fltrace/xgboost_cpu_lib,
+# extracted from the `xgboost-cpu` PyPI wheel - not pip-installed, since that
+# package shares the `xgboost` import name and would silently replace
+# whatever xgboost/xgboost-cpu is already pip-installed for other uses).
+# The regular GPU-enabled `pip install xgboost` wheel's libxgboost.so bundles
+# CUDA/thrust support that gets triggered even for CPU-only inference calls
+# (xgboost::common::AllVisibleGPUs()) - on a machine with no GPU/CUDA driver
+# at all, something in that bundled code deadlocks fltrace.so's single
+# handler thread on a glibc-internal lock (__exit_funcs_lock via a CUDA
+# error-category static's atexit registration), never returning. The
+# xgboost-cpu build has no CUDA/thrust code compiled in at all, avoiding the
+# code path structurally rather than working around it.
+XGBOOST_LIB_DIR = $(CURDIR)/tools/fltrace/xgboost_cpu_lib
+XGBOOST_LIBS = -L$(XGBOOST_LIB_DIR) -lxgboost -Wl,-rpath=$(XGBOOST_LIB_DIR)
 XGBOOST_LINK_FLAGS = -Wl,--whole-archive $(XGBOOST_LIBS) -Wl,--no-whole-archive -lstdc++
 endif
 endif

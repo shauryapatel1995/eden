@@ -18,7 +18,11 @@ extern void preempt(void);
  */
 static inline void preempt_disable(void)
 {
-	__asm__ volatile("addl $1, %%fs:preempt_cnt@tpoff" : : : "memory", "cc");
+	/* NOTE: this used to be raw "%fs:preempt_cnt@tpoff" asm forcing the
+	 * local-exec TLS model, which only works when linked directly into an
+	 * executable. Plain C lets the compiler pick a model that also works
+	 * when this header is compiled into a shared object (e.g. fltrace.so). */
+	preempt_cnt++;
 	barrier();
 }
 
@@ -30,7 +34,7 @@ static inline void preempt_disable(void)
 static inline void preempt_enable_nocheck(void)
 {
 	barrier();
-	__asm__ volatile("subl $1, %%fs:preempt_cnt@tpoff" : : : "memory", "cc");
+	preempt_cnt--;
 }
 
 /**

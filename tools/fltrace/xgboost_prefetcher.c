@@ -41,7 +41,8 @@ typedef struct {
 static XGBoostModel* global_model = NULL;
 static pthread_mutex_t model_init_lock = PTHREAD_MUTEX_INITIALIZER;
 
-#define XGBOOST_LIB_PATH "/usr/local/lib/libxgboost.so"
+#define XGBOOST_LIB_PATH_ENV "EDEN_PREFETCH_XGBOOST_LIB_PATH"
+#define XGBOOST_LIB_PATH_DEFAULT "/usr/local/lib/libxgboost.so"
 #define XGBOOST_MODEL_PATH_ENV "EDEN_PREFETCH_MODEL_PATH"
 #define XGBOOST_MODEL_PATH_DEFAULT "./eden_xgboost_model.json"
 
@@ -50,10 +51,12 @@ void xgboost_pre_init(void) {
     // Attempt to open libxgboost.so. RTLD_NOW forces immediate resolution of all
     // symbols, and the act of dlopen() is what triggers the static constructors
     // of libxgboost.so to run.
-    void *handle = dlopen(XGBOOST_LIB_PATH, RTLD_NOW | RTLD_GLOBAL);
+    const char* lib_path = getenv(XGBOOST_LIB_PATH_ENV);
+    if (!lib_path) lib_path = XGBOOST_LIB_PATH_DEFAULT;
+    void *handle = dlopen(lib_path, RTLD_NOW | RTLD_GLOBAL);
 
     if (!handle) {
-        fprintf(stderr, "FATAL ERROR: Failed to explicitly dlopen and initialize libxgboost.so at %s\n", XGBOOST_LIB_PATH);
+        fprintf(stderr, "FATAL ERROR: Failed to explicitly dlopen and initialize libxgboost.so at %s\n", lib_path);
         fprintf(stderr, "dlerror: %s\n", dlerror());
         exit(1);
     }
@@ -108,6 +111,18 @@ int load_model(XGBoostModel* model, const char* model_path) {
             fprintf(stderr, "XGBoost error: %s\n", error_msg);
         }
         return -1;
+    }
+
+    // Force CPU-only: without this, the first prediction call lazily probes
+    // for GPUs (xgboost::common::AllVisibleGPUs()), which under this
+    // process's malloc/mmap interposition deadlocks on the handler thread
+    // (self-recursive glibc __exit_funcs_lock via a CUDA-error-category
+    // static's atexit registration) - a machine with no GPU/CUDA driver at
+    // all still triggers this if the device probe isn't skipped upfront.
+    if (XGBoosterSetParam(model->booster, "device", "cpu") != 0) {
+        const char* error_msg = XGBGetLastError();
+        fprintf(stderr, "Failed to force CPU device: %s\n",
+            error_msg ? error_msg : "unknown error");
     }
 
     // Load model from file
