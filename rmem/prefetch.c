@@ -119,8 +119,12 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
      * instead of up to ncandidates individual predict calls each paying
      * its own per-call overhead.
      */
+    RSTAT(PREFETCH_CANDIDATES_GATED) += ncandidates;
     if (ncandidates > 0)
         page_postfetch_preds(compact_features, compact_responses, ncandidates);
+    for (int k = 0; k < ncandidates; k++)
+        if (compact_responses[k] == 1)
+            RSTAT(PREFETCH_CANDIDATES_POSITIVE)++;
 
     /*
      * Pass 3: act on results. Every candidate here is already locked, so

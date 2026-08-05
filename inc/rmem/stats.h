@@ -25,6 +25,17 @@ enum {
     RSTAT_RDAHEADS,
     RSTAT_RDAHEAD_PAGES,
     RSTAT_PREFETCHES,
+    RSTAT_PREFETCH_CANDIDATES_GATED,    /* candidates that passed
+                                          * is_page_prefetchable() and
+                                          * actually got scored by the
+                                          * model - out of up to 516
+                                          * possible per fault */
+    RSTAT_PREFETCH_CANDIDATES_POSITIVE, /* of those, how many the model
+                                          * predicted positive on, before
+                                          * checking buffer/backend
+                                          * availability - RSTAT_PREFETCHES
+                                          * is the subset of these that
+                                          * actually got a read posted */
 
     /* eviction stats */
     RSTAT_EVICTS,
@@ -70,6 +81,15 @@ enum {
                                   * the clock once the handler reads the
                                   * uffd event, not when the fault truly
                                   * occurred) */
+    RSTAT_HANDLE_FAULT_CYCLES,  /* total handler-thread time spent inside
+                                  * handle_page_fault() across every call
+                                  * (fresh faults and wait-queue re-checks
+                                  * of in-progress ones), summed - this is
+                                  * the direct handler-thread cost of
+                                  * servicing page faults, separate from
+                                  * APP_FAULT_WAIT_CYCLES (the faulting
+                                  * thread's own blocked time) */
+
     /* rmem hints */
     RSTAT_ANNOT_HITS,
 

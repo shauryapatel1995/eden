@@ -364,8 +364,12 @@ static void* rmem_handler(void *arg)
         fault = list_top(&my_hthr->fault_wait_q, fault_t, link);
         while (fault != NULL) {
             next = list_next(&my_hthr->fault_wait_q, fault, link);
-            fstatus = handle_page_fault(my_hthr->bkend_chan_id, fault, 
-                &nevicts_needed, &hthr_cbs);
+            {
+                unsigned long __hpf_tsc = rdtsc();
+                fstatus = handle_page_fault(my_hthr->bkend_chan_id, fault,
+                    &nevicts_needed, &hthr_cbs);
+                RSTAT(HANDLE_FAULT_CYCLES) += rdtsc() - __hpf_tsc;
+            }
             switch (fstatus) {
                 case FAULT_DONE:
                     log_debug("%s - done, released from wait", FSTR(fault));
@@ -420,8 +424,12 @@ static void* rmem_handler(void *arg)
             work_done = true;
 
             /* start handling fault */
-            fstatus = handle_page_fault(my_hthr->bkend_chan_id, fault, 
-                &nevicts_needed, &hthr_cbs);
+            {
+                unsigned long __hpf_tsc = rdtsc();
+                fstatus = handle_page_fault(my_hthr->bkend_chan_id, fault,
+                    &nevicts_needed, &hthr_cbs);
+                RSTAT(HANDLE_FAULT_CYCLES) += rdtsc() - __hpf_tsc;
+            }
             switch (fstatus) {
                 case FAULT_DONE:
                     fault_done(fault, my_hthr->bkend_chan_id, &nevicts_needed);
@@ -509,8 +517,16 @@ hthread_t* new_rmem_handler_thread(int pincore_id)
     hthr->stop = false;
     hthr->fsampler_id = -1;
     r = pthread_create(&hthr->thread, NULL, rmem_handler, (void*)hthr);
-    if (r < 0) {
-        log_err("pthread_create for rmem handler failed: %d", errno);
+    if (r != 0) {
+        /* pthread_create() returns 0 on success or a positive errno-style
+         * value on failure - it does NOT return a negative value the way
+         * plain syscalls do, and does NOT set the global errno. The old
+         * "r < 0" check here could never fire, silently swallowing thread
+         * creation failures and returning a handle to a thread that was
+         * never actually created - the app thread would then fault
+         * normally with no handler ever able to service it, hanging
+         * forever in handle_userfault with no visible error. */
+        log_err("pthread_create for rmem handler failed: %d", r);
         return NULL;
     }
 

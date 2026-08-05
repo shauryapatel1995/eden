@@ -531,10 +531,15 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
     /* see if this fault needs to be acted upon, because some other fault 
      * on the same page might have handled it by now */
     if (is_fault_serviced(fault, /*page locked=*/ false)) {
-        /* some other fault addressed the page, fault done */
+        /* some other fault (or a prefetch) already resolved the page by
+         * the time we got to check - the app still waited from create_tsc
+         * to now, so this needs the same accounting fault_read_done()
+         * does for the non-redundant case */
         fault->uffd_explicit_wake = fault->from_kernel;
         log_debug("%s - fault done, was redundant", FSTR(fault));
         RSTAT(FAULTS_REDUNDANT)++;
+        if (fault->from_kernel)
+            RSTAT(APP_FAULT_WAIT_CYCLES) += rdtsc() - fault->create_tsc;
         return FAULT_DONE;
     }
     else {
@@ -557,9 +562,11 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
 
             /* see if the fault got serviced during the locking */
             if (unlikely(is_fault_serviced(fault, /*locked=*/ true))) {
-                /* some other fault addressed the page, fault done */
+                /* same as the unlocked redundant check above */
                 fault->uffd_explicit_wake = fault->from_kernel;
                 log_debug("%s - fault done, was redundant", FSTR(fault));
+                if (fault->from_kernel)
+                    RSTAT(APP_FAULT_WAIT_CYCLES) += rdtsc() - fault->create_tsc;
                 return FAULT_DONE;
             }
 
@@ -617,14 +624,25 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
                 assert(wrprotect);
                 
                 /* write fault on existing page; just remove wrprotection */
-                ret = uffd_wp_remove(userfault_fd, fault->page, 
+                ret = uffd_wp_remove(userfault_fd, fault->page,
                     nchunks * CHUNK_SIZE, no_wake, true, &n_retries);
                 assertz(ret);
                 RSTAT(UFFD_RETRIES) += n_retries;
 
+                /* this is what actually resolves the fault for real
+                 * (from_kernel) faults on this path - e.g. one that got
+                 * queued behind an in-flight prefetch and is only now
+                 * resolving because that prefetch's completion already
+                 * marked the page present above. fault_read_done() (the
+                 * only other place APP_FAULT_WAIT_CYCLES is recorded)
+                 * never runs for this path, so without this the real,
+                 * nonzero wait such faults experience goes uncounted */
+                if (fault->from_kernel)
+                    RSTAT(APP_FAULT_WAIT_CYCLES) += rdtsc() - fault->create_tsc;
+
                 /* done */
                 log_debug("%s - removed wp for %d pages", FSTR(fault), nchunks);
-                ret = set_page_flags_range(mr, fault->page, 
+                ret = set_page_flags_range(mr, fault->page,
                     nchunks * CHUNK_SIZE, PFLAG_DIRTY);
                 assert(ret == nchunks);
                 return FAULT_DONE;

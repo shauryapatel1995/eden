@@ -22,6 +22,8 @@ const char *rstat_names[] = {
     "rdahead_ops",
     "rdahead_pages",
     "prefetched_pages",
+    "prefetch_candidates_gated",
+    "prefetch_candidates_positive",
 
     /* eviction stats */
     "evict_ops",
@@ -54,6 +56,7 @@ const char *rstat_names[] = {
 	"backend_wait_cycles",
 	"app_fault_wait_cycles",
 	"prefetch_scan_cycles",
+	"handle_fault_cycles",
 
 	/* rmem hints */
 	"annot_hits",

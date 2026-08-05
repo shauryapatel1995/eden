@@ -52,10 +52,20 @@ void logk(int level, const char* filename, const char *fmt, ...)
 	va_start(ptr, fmt);
 	vsnprintf(buf + off, MAX_LOG_LEN - off, fmt, ptr);
 	va_end(ptr);
-	puts(buf);
+	/* stderr, not stdout: this runs on the handler thread (and other
+	 * internal threads) as well as app threads, and puts()/stdout share
+	 * a single lock with whatever the traced application itself prints
+	 * to stdout. If the app is holding that lock while blocked on a page
+	 * fault (e.g. mid printf, waiting on a malloc that faulted), and the
+	 * handler thread needs this same lock just to log its own startup
+	 * message before it can reach its fault-servicing loop, that's a
+	 * real deadlock - confirmed via gdb while debugging SPEC mcf, which
+	 * hits this deadlock on essentially every run since its first
+	 * statement is a version banner print. */
+	fprintf(stderr, "%s\n", buf);
 
 	if (level <= LOG_ERR)
-		fflush(stdout);
+		fflush(stderr);
 }
 
 #define MAX_CALL_DEPTH	256
@@ -63,7 +73,7 @@ void logk_backtrace(void)
 {
 	void *buf[MAX_CALL_DEPTH];
 	const int calls = backtrace(buf, ARRAY_SIZE(buf));
-	backtrace_symbols_fd(buf, calls, 1);
+	backtrace_symbols_fd(buf, calls, 2);
 }
 
 void logk_bug(bool fatal, const char *expr,
