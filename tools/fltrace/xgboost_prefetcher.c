@@ -18,11 +18,11 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
-#include <stdatomic.h>
 #include <pthread.h>
 #include <dlfcn.h>
 #include "rmem/common.h"
 #include "rmem/prefetch.h"
+#include "native_prefetch_predict.h"
 
 // XGBoost C API
 #include <xgboost/c_api.h>
@@ -154,77 +154,16 @@ void preprocess_features(FeatureVector* features) {
     features->delta = features->delta / 4096.0f;
 }
 
-/**
- * Make prediction for a single sample
- */
-int predict_single(XGBoostModel* model, FeatureVector* features, float* prediction) {
-    if (!model || !model->is_loaded || !features || !prediction) {
-        fprintf(stderr, "Invalid input parameters\n");
-        return -1;
-    }
-
-    // Preprocess features
-    preprocess_features(features);
-
-    // Prepare feature array
-    float feature_array[NUM_FEATURES];
-    feature_array[FEATURE_PC] = (float)features->pc;
-    feature_array[FEATURE_OFFSET] = (float)features->offset;
-    feature_array[FEATURE_DELTA] = features->delta;
-    feature_array[FEATURE_OFFSET_FROM_FAULTING] = (float)features->offset_from_faulting;
-
-    // Create DMatrix for single prediction
-    DMatrixHandle dtest;
-    if (XGDMatrixCreateFromMat(feature_array, 1, NUM_FEATURES, -1, &dtest) != 0) {
-        fprintf(stderr, "Failed to create DMatrix\n");
-        return -1;
-    }
-
-    // Make prediction
-    bst_ulong out_len;
-    const float* out_result;
-
-    if (XGBoosterPredict(model->booster, dtest, 0, 0, 0, &out_len, &out_result) != 0) {
-        fprintf(stderr, "Failed to make prediction\n");
-        XGDMatrixFree(dtest);
-        return -1;
-    }
-
-    if (out_len != 1) {
-        fprintf(stderr, "Unexpected prediction output length: %lu\n", out_len);
-        XGDMatrixFree(dtest);
-        return -1;
-    }
-
-    *prediction = out_result[0];
-
-    /* TEMP DEBUG: check raw feature values reaching the model and the raw
-     * probability it outputs, to see whether pc is sane and whether scores
-     * ever approach the 0.5 threshold */
-    {
-        static _Atomic int __calls = 0;
-        static _Atomic float __max_prob = 0;
-        int n = atomic_fetch_add(&__calls, 1);
-        float prev_max = atomic_load(&__max_prob);
-        while (*prediction > prev_max &&
-               !atomic_compare_exchange_weak(&__max_prob, &prev_max, *prediction))
-            ;
-        if (n < 20) {
-            log_info("TEMP DEBUG: predict#%d pc=%.0f offset=%.0f delta=%.6f "
-                "offset_from_faulting=%.0f prob=%.6f",
-                n, feature_array[FEATURE_PC], feature_array[FEATURE_OFFSET],
-                feature_array[FEATURE_DELTA],
-                feature_array[FEATURE_OFFSET_FROM_FAULTING], *prediction);
-        }
-        if (n > 0 && n % 100000 == 0) {
-            log_info("TEMP DEBUG: %d predictions so far, max prob seen: %.6f",
-                n, atomic_load(&__max_prob));
-        }
-    }
-
-    XGDMatrixFree(dtest);
-    return 0;
-}
+/* config for XGBoosterPredictFromDense: normal prediction, all trees, no
+ * strict shape (matches the flat per-row output XGBoosterPredict used to
+ * give us). "missing": NaN is the correct sentinel for our data - unlike
+ * the old DMatrix path's "missing": -1, NaN can never collide with a real
+ * feature value (the old -1 sentinel did: offset_from_faulting == -1 is a
+ * legitimate value hit on nearly every fault, silently forcing that
+ * feature to "missing" instead of using it) */
+#define PREDICT_CONFIG_JSON \
+    "{\"type\": 0, \"training\": false, \"iteration_begin\": 0, " \
+    "\"iteration_end\": 0, \"missing\": NaN, \"strict_shape\": false}"
 
 /**
  * Make predictions for batch of samples
@@ -236,12 +175,9 @@ int predict_batch(XGBoostModel* model, FeatureVector* features_batch,
         return -1;
     }
 
-    // Prepare feature matrix
-    float* feature_matrix = (float*)malloc(batch_size * NUM_FEATURES * sizeof(float));
-    if (!feature_matrix) {
-        fprintf(stderr, "Failed to allocate memory for feature matrix\n");
-        return -1;
-    }
+    /* stack buffer - batch_size is bounded by prefetch.c's compact arrays
+     * (max 516 candidates/fault), so this is at most ~8KB */
+    float feature_matrix[batch_size * NUM_FEATURES];
 
     // Fill feature matrix and preprocess
     for (int i = 0; i < batch_size; i++) {
@@ -255,38 +191,35 @@ int predict_batch(XGBoostModel* model, FeatureVector* features_batch,
         feature_matrix[base_idx + FEATURE_OFFSET_FROM_FAULTING] = (float)temp_features.offset_from_faulting;
     }
 
-    // Create DMatrix
-    DMatrixHandle dtest;
-    if (XGDMatrixCreateFromMat(feature_matrix, batch_size, NUM_FEATURES, -1, &dtest) != 0) {
-        fprintf(stderr, "Failed to create DMatrix for batch\n");
-        free(feature_matrix);
-        return -1;
-    }
+    /* Inplace prediction directly from feature_matrix - no DMatrix
+     * create/destroy at all (not even a reused one). __array_interface__
+     * just describes the buffer we already have; NULL proxy is fine since
+     * we have no extra meta info (categorical maps, base_margin, etc) to
+     * attach - PC is a plain numeric feature. */
+    char values_json[160];
+    snprintf(values_json, sizeof(values_json),
+        "{\"data\": [%llu, false], \"shape\": [%d, %d], \"typestr\": \"<f4\", \"version\": 3}",
+        (unsigned long long)(uintptr_t)feature_matrix, batch_size, NUM_FEATURES);
 
-    // Make predictions
-    bst_ulong out_len;
+    bst_ulong const *out_shape;
+    bst_ulong out_dim;
     const float* out_result;
 
-    if (XGBoosterPredict(model->booster, dtest, 0, 0, 0, &out_len, &out_result) != 0) {
-        fprintf(stderr, "Failed to make batch predictions\n");
-        XGDMatrixFree(dtest);
-        free(feature_matrix);
+    if (XGBoosterPredictFromDense(model->booster, values_json, PREDICT_CONFIG_JSON,
+                                   NULL, &out_shape, &out_dim, &out_result) != 0) {
+        fprintf(stderr, "Failed to make batch predictions: %s\n", XGBGetLastError());
         return -1;
     }
 
-    if (out_len != (bst_ulong)batch_size) {
-        fprintf(stderr, "Unexpected batch prediction output length: %lu (expected %d)\n",
-                out_len, batch_size);
-        XGDMatrixFree(dtest);
-        free(feature_matrix);
+    if (out_dim < 1 || out_shape[0] != (bst_ulong)batch_size) {
+        fprintf(stderr, "Unexpected batch prediction output shape (dim=%lu, shape[0]=%lu, expected %d)\n",
+                out_dim, out_dim >= 1 ? out_shape[0] : 0, batch_size);
         return -1;
     }
 
     // Copy results
     memcpy(predictions, out_result, batch_size * sizeof(float));
 
-    XGDMatrixFree(dtest);
-    free(feature_matrix);
     return 0;
 }
 
@@ -404,24 +337,42 @@ unsigned long page_prefetch_preds(FeatureVector features[], int *response_arr) {
  * Features: input features computed at pagefault.
  * Reponse arr: Output predictions.
  */
+#define NATIVE_MODEL_ENV "EDEN_PREFETCH_NATIVE_MODEL"
+
 unsigned long page_postfetch_preds(FeatureVector features[], int *response_arr, int batch_size) {
+    static int native_mode = -1;
+    if (native_mode == -1) {
+        const char *env = getenv(NATIVE_MODEL_ENV);
+        native_mode = (env && env[0] == '1') ? 1 : 0;
+        log_info("prefetch inference mode: %s",
+            native_mode ? "native (hand-compiled trees, no libxgboost)" : "libxgboost");
+    }
+
+    /* native path: hand-compiled tree evaluator baked in at build time from
+     * native_tree_model.h, no DMatrix/JSON/libxgboost call at all */
+    if (native_mode)
+        return native_predict_batch(features, batch_size, response_arr);
+
+    float probs[batch_size];
 
     if (!global_model || !global_model->is_loaded) {
         log_warn_ratelimited("prefetch model not initialized, call init_prefetcher() first");
         return 1;
     }
 
-    for(int i = 0; i < batch_size; i++) {
-        float prediction_prob;
-        response_arr[i] = 0;
-        assert(global_model);
-        assert(features != NULL);
-        if (predict_single(global_model, &features[i], &prediction_prob) == 0) {
-            response_arr[i] = probability_to_prediction(prediction_prob);
-        } else {
-            fprintf(stderr, "Single prediction failed\n");
-        }
+    /* one DMatrix create/predict/free for the whole batch instead of
+     * batch_size separate ones (each candidate used to cost its own
+     * predict_single() call) - the DMatrix create/destroy overhead, not
+     * the actual tree evaluation, dominates cost per call regardless of
+     * row count, so batching amortizes nearly all of it away */
+    if (predict_batch(global_model, features, batch_size, probs) != 0) {
+        fprintf(stderr, "Batch prediction failed\n");
+        memset(response_arr, 0, batch_size * sizeof(*response_arr));
+        return 1;
     }
+
+    for (int i = 0; i < batch_size; i++)
+        response_arr[i] = probability_to_prediction(probs[i]);
 
     return 0;
 }

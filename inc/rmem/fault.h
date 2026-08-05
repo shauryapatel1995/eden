@@ -46,9 +46,12 @@ typedef struct fault {
     thread_t* thread;
     void* bkend_buf;
     unsigned long tstamp_tsc;
+    unsigned long create_tsc;  /* rdtsc() when first observed from uffd - for
+                                 * measuring total time an app thread actually
+                                 * blocks on real (from_kernel) page faults */
 
 	struct list_node link;
-    uint8_t cacheline_padding[128 - 80]; /* pad fault_t to 2 cache lines */
+    uint8_t cacheline_padding[128 - 88]; /* pad fault_t to 2 cache lines */
 } fault_t;
 BUILD_ASSERT(sizeof(fault_t) % CACHE_LINE_SIZE == 0);
 BUILD_ASSERT(FAULT_MAX_RDAHEAD_SIZE <= UINT8_MAX);   /* due to rdahead */

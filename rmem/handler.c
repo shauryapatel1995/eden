@@ -187,6 +187,7 @@ static inline fault_t* read_uffd_fault()
     struct uffd_msg message;
     struct fault* fault;
     unsigned long long addr, flags;
+    unsigned long fault_create_tsc;
 #if defined(UFFD_PC_SUPPORTED) || defined(DO_TRACING)
     unsigned long pc;
 #endif
@@ -211,6 +212,11 @@ static inline fault_t* read_uffd_fault()
             }
             return NULL;
         }
+
+        /* stamp as early as possible - closest we can get to "when did
+         * the app thread actually start blocking" without kernel support
+         * for the real fault time */
+        fault_create_tsc = rdtsc();
 
         /* only need page fault events */
         if (unlikely(message.event != UFFD_EVENT_PAGEFAULT)) {
@@ -249,6 +255,7 @@ static inline fault_t* read_uffd_fault()
         memset(fault, 0, sizeof(fault_t));
         fault->page = addr & ~CHUNK_MASK;
         fault->faulting_addr = addr;
+        fault->create_tsc = fault_create_tsc;
 #ifdef UFFD_PC_SUPPORTED
         fault->pc = pc;
 #endif

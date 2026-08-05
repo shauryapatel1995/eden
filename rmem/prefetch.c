@@ -32,24 +32,46 @@
 unsigned long page_postfetch(fault_t * f, FeatureVector *features,
                                 int *responses, int chan_id, int *nevicts_needed)
 {
-#ifdef benchmark_model
-    struct timeval t1, t2;
-    double elapsed_time;
-#endif
     void *bkend_buf;
     pgflags_t oldflags;
     int nprefetches = 0, noverflow = 0;
     unsigned long long pressure;
-    uint64_t *ptr = (uint64_t *) f->page;
     int faulting_location = (f->faulting_addr - f->page) / sizeof(uint64_t);
+    bool stop_early;
 
-    assert(ptr);
-    /* Setup pointer features */
-    for(int i = 0; i < 512; i++, ptr++) {
+    /* candidates that pass is_page_prefetchable() (and are thus locked -
+     * either a prefetch gets posted for them or their lock must be
+     * released) get compacted here, so the batched inference call below
+     * only scores candidates we could actually act on instead of all 516
+     * regardless of prefetchability - most candidates don't pass (already
+     * present, unregistered, etc.), so scoring all of them unconditionally
+     * made XGBoost evaluate far more rows per fault than before, not
+     * fewer calls over the same rows */
+    FeatureVector compact_features[516];
+    int compact_responses[516];
+    uint64_t compact_ptr_val[516];
+    int ncandidates = 0;
+
+    assert(f->page);
+    /* Setup pointer features. delta is intentionally NOT computed here
+     * (would be (*ptr - f->page) / 4096) - the model was trained with
+     * delta zeroed for pointer-type candidates specifically because that
+     * was the one feature that required reading the actual pointer value
+     * off the faulted page. We tried overlapping inference with the real
+     * read using that property (page_prefetch_prescan(), since reverted)
+     * but it was a net loss on both LOCAL and RDMA backends: without
+     * is_page_prefetchable()'s cheap real-pointer-value gate available
+     * before the read completes, prescan had to score all 516 candidates
+     * unconditionally (~200us/fault), which is far more than the RDMA
+     * round-trip it was meant to hide behind (~10us/fault) - so gating
+     * first and only inferring on the (usually much smaller) surviving
+     * subset, as below, wins in practice despite still running after the
+     * read. */
+    for(int i = 0; i < 512; i++) {
         FeatureVector *feature = &features[i];
         feature->pc = f->pc;
         feature->offset = i;
-        feature->delta = (*ptr - f->page) / 4096;
+        feature->delta = 0;
         feature->offset_from_faulting = i - faulting_location;
         responses[i] = 0;
     }
@@ -62,91 +84,84 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
         feature->offset_from_faulting = 0;
         responses[i] = 0;
     }
-#ifdef benchmark_model
-    gettimeofday(&t1, NULL);
-#endif
-    /* This part of the code runs inference on all 600
-     * candidates. For now we are changing the strategy to
-     * run if the ptr is actually present.
-     *  page_postfetch_preds(features, responses);
-     */
-#ifdef benchmark_model
-    gettimeofday(&t2, NULL);
-    elapsed_time = (t2.tv_sec - t1.tv_sec) * 1000000;      // sec to ms
-    elapsed_time += (t2.tv_usec - t1.tv_usec);   // us to ms
-    printf("%f us.\n", elapsed_time);
-#endif
+
     /*
-     * 1. Generate address value.
-     * 2. Do the same checks as the ones in readahead plus walking
-     * the page table.
-     * If is_page_prefetchable succeeds, the page is locked.
-     * Unlocking needs to be managed by this function.
-     * 3. Run inference on page.
-     * 4. Post an async read for the candidate - post_read_prefetch() only
-     * guarantees the read was posted, not that it's done (same contract as
-     * post_read(), see backend.h). Completion - copying the data in,
-     * marking the page present, freeing the backend buf, and clearing
-     * PFLAG_WORK_ONGOING - happens later out of the backend's
-     * check_for_completions(), not inline here.
+     * Pass 1: check is_page_prefetchable() for every candidate (512
+     * pointer-chase + 4 sequential) - this both filters out candidates we
+     * can't act on anyway (already present, not registered, etc.) and
+     * locks (PFLAG_WORK_ONGOING) the ones that pass. Compact only the
+     * locked ones so the batched inference call below scores just the
+     * candidates we could actually prefetch, instead of wasting cycles on
+     * ones we already know we'll skip.
      */
     for (int i = 0; i < 512; i++) {
         assert(f);
         uint64_t ptr_val = *((uint64_t *) f->page + i);
         ptr_val = ptr_val & ~CHUNK_MASK;
         if (is_page_prefetchable(f, ptr_val)) {
-            /* Do the inference to get prediction */
-            page_postfetch_preds(&features[i], responses, 1);
-            if (responses[0] == 1 && ptr_val != 0) {
-                /* each candidate gets its own buf - freed at its own
-                 * completion, unlike a fault's f->bkend_buf this isn't
-                 * shared/reused across candidates since multiple reads can
-                 * be in flight at once */
-                bkend_buf = bkend_buf_alloc();
-                if (!bkend_buf) {
-                    /* no free backend bufs - prefetching is best-effort,
-                     * so just skip this candidate rather than block/crash */
-                    clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
-                    continue;
-                }
-                if (rmbackend->post_read_prefetch(chan_id, f, ptr_val, bkend_buf)) {
-                    /* backend busy; stop trying more candidates for this
-                     * fault, it'll likely still be busy for the rest */
-                    bkend_buf_free(bkend_buf);
-                    clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
-                    goto out;
-                }
-                nprefetches++;
-            } else {
-                clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
-            }
+            compact_features[ncandidates] = features[i];
+            compact_ptr_val[ncandidates] = ptr_val;
+            ncandidates++;
         }
     }
-
     for (int i = 512; i < 516; i++) {
-        uint64_t ptr_val =  f->page + (i - 511);
+        uint64_t ptr_val = f->page + (i - 511);
         ptr_val = ptr_val & ~CHUNK_MASK;
-        if(is_page_prefetchable(f, ptr_val)) {
-            page_postfetch_preds(&features[i], responses, 1);
-            if (responses[0] == 1) {
-                bkend_buf = bkend_buf_alloc();
-                if (!bkend_buf) {
-                    clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
-                    continue;
-                }
-                if (rmbackend->post_read_prefetch(chan_id, f, ptr_val, bkend_buf)) {
-                    bkend_buf_free(bkend_buf);
-                    clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
-                    goto out;
-                }
-                nprefetches++;
-            } else {
-                clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
-            }
+        if (is_page_prefetchable(f, ptr_val)) {
+            compact_features[ncandidates] = features[i];
+            compact_ptr_val[ncandidates] = ptr_val;
+            ncandidates++;
         }
     }
 
-out:
+    /*
+     * Pass 2: one batched inference call for every locked candidate,
+     * instead of up to ncandidates individual predict calls each paying
+     * its own per-call overhead.
+     */
+    if (ncandidates > 0)
+        page_postfetch_preds(compact_features, compact_responses, ncandidates);
+
+    /*
+     * Pass 3: act on results. Every candidate here is already locked, so
+     * on backend-busy we can't just stop early like the old single-pass
+     * code did (that was safe there only because not-yet-checked
+     * candidates hadn't been locked yet) - remaining locked candidates
+     * must still have their lock released or they'd leak.
+     */
+    stop_early = false;
+    for (int k = 0; k < ncandidates; k++) {
+        uint64_t ptr_val = compact_ptr_val[k];
+        if (stop_early) {
+            clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
+            continue;
+        }
+        if (compact_responses[k] == 1 && ptr_val != 0) {
+            /* each candidate gets its own buf - freed at its own
+             * completion, unlike a fault's f->bkend_buf this isn't
+             * shared/reused across candidates since multiple reads can
+             * be in flight at once */
+            bkend_buf = bkend_buf_alloc();
+            if (!bkend_buf) {
+                /* no free backend bufs - prefetching is best-effort,
+                 * so just skip this candidate rather than block/crash */
+                clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
+                continue;
+            }
+            if (rmbackend->post_read_prefetch(chan_id, f, ptr_val, bkend_buf)) {
+                /* backend busy; stop trying more candidates for this
+                 * fault, it'll likely still be busy for the rest */
+                bkend_buf_free(bkend_buf);
+                clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
+                stop_early = true;
+                continue;
+            }
+            nprefetches++;
+        } else {
+            clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
+        }
+    }
+
     /*
      * book memory pressure for the prefetch reads we just posted (mirrors
      * how handle_page_fault() accounts pressure right after posting a

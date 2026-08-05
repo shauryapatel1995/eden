@@ -52,6 +52,8 @@ const char *rstat_names[] = {
     "total_cycles",		/* only valid for handler cores */
     "work_cycles",		/* only valid for handler cores */
 	"backend_wait_cycles",
+	"app_fault_wait_cycles",
+	"prefetch_scan_cycles",
 
 	/* rmem hints */
 	"annot_hits",

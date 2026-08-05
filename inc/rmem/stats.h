@@ -55,7 +55,21 @@ enum {
     RSTAT_TOTAL_CYCLES,
     RSTAT_WORK_CYCLES,
     RSTAT_BACKEND_WAIT_CYCLES,  /* time wasted because backend is busy  */
-
+    RSTAT_APP_FAULT_WAIT_CYCLES,    /* total time an app thread spent
+                                      * actually blocked on a real
+                                      * (from_kernel) page fault, summed
+                                      * across all such faults - not the
+                                      * handler thread's own busy/idle
+                                      * time, the faulting thread's */
+    RSTAT_PREFETCH_SCAN_CYCLES, /* time spent inside page_postfetch()
+                                  * (candidate scan + XGBoost inference) -
+                                  * time the single handler thread is NOT
+                                  * available to notice/service the next
+                                  * real fault, which APP_FAULT_WAIT_CYCLES
+                                  * alone doesn't capture (it only starts
+                                  * the clock once the handler reads the
+                                  * uffd event, not when the fault truly
+                                  * occurred) */
     /* rmem hints */
     RSTAT_ANNOT_HITS,
 

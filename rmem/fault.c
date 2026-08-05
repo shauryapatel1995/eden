@@ -406,10 +406,17 @@ int fault_read_done(fault_t* f)
     wrprotect = f->is_read;
     no_wake = !f->from_kernel;
     size = (1 + f->rdahead) * CHUNK_SIZE;
-    r = uffd_copy(userfault_fd, f->page, (unsigned long) f->bkend_buf, size, 
+    r = uffd_copy(userfault_fd, f->page, (unsigned long) f->bkend_buf, size,
         wrprotect, no_wake, true, &n_retries);
     assertz(r);
     RSTAT(UFFD_RETRIES) += n_retries;
+
+    /* this uffd_copy() call is what actually wakes the faulting thread for
+     * real (from_kernel) faults (no_wake is false exactly in that case,
+     * above) - so the gap between when we first observed this fault and
+     * right now is real wall-clock time the app thread spent blocked */
+    if (f->from_kernel)
+        RSTAT(APP_FAULT_WAIT_CYCLES) += rdtsc() - f->create_tsc;
 
     /* free the backend buffer */
     bkend_buf_free(f->bkend_buf);
@@ -432,11 +439,18 @@ void fault_done(fault_t* f, int chan_id, int *nevicts_needed)
     int i, r;
     pgthread_t owner_kthr;
     pgflags_t oldflags;
+#ifdef DO_PREFETCH
+    unsigned long postfetch_start_tsc;
+#endif
 
 #ifdef DO_PREFETCH
     /* speculatively prefetch pointer-chase candidates off the page we just
-     * finished servicing, before releasing its lock */
+     * finished servicing, before releasing its lock. this runs on the
+     * single handler thread, which can't poll for the next real uffd
+     * fault while it's in here - see RSTAT_PREFETCH_SCAN_CYCLES */
+    postfetch_start_tsc = rdtsc();
     page_postfetch(f, features, responses, chan_id, nevicts_needed);
+    RSTAT(PREFETCH_SCAN_CYCLES) += rdtsc() - postfetch_start_tsc;
 #endif
 
 #ifdef DO_TRACING
