@@ -12,6 +12,7 @@
 
 #include "rmem/backend.h"
 #include "rmem/fault.h"
+#include "rmem/page.h"
 #include "rmem/rdma.h"
 #include "rmem/stats.h"
 
@@ -603,6 +604,12 @@ int rdma_destroy() {
     while (!SLIST_EMPTY(&servers_list)) {
         struct server_conn_t *s = SLIST_FIRST(&servers_list);
         remote_client_destroy(s);
+        /* remove before unmapping - s->link lives inside the mapping
+         * being freed below, and the list head otherwise keeps pointing
+         * at this now-invalid entry forever (this loop never terminates,
+         * repeatedly operating on unmapped memory - never exercised
+         * before since nothing called rdma_destroy() until now) */
+        SLIST_REMOVE_HEAD(&servers_list, link);
         munmap(s, sizeof(struct server_conn_t));
     }
     return 0;
@@ -686,7 +693,78 @@ int rdma_post_read(int chan_id, fault_t* f)
     /* increment req_id */
     conn->read_req_idx++;
     assert(req_id + 1 == conn->read_req_idx); /*no unexpected concurrent reads*/
-    if (conn->read_req_idx >= MAX_R_REQS_PER_CONN_CHAN) 
+    if (conn->read_req_idx >= MAX_R_REQS_PER_CONN_CHAN)
+        conn->read_req_idx = 0;
+
+    /* success */
+    return 0;
+}
+
+/* post read on a channel for a speculatively prefetched page (not part of
+ * the fault's own read-ahead range). unlike rdma_post_read(), this doesn't
+ * allocate its own bkend_buf or touch f->bkend_buf - f is the fault that
+ * triggered the speculative scan, not a fault for this candidate page, so
+ * f->bkend_buf is already in use for f's own read. also doesn't hang onto
+ * f itself past this call - f will likely be freed and recycled for an
+ * unrelated fault well before this async read completes, so mr/evict_prio
+ * are captured as plain values instead */
+int rdma_post_read_prefetch(int chan_id, fault_t *f,
+    unsigned long addr, void *bkend_buf)
+{
+    struct connection *conn;
+    unsigned long remote_addr, offset;
+    size_t size;
+    int req_id;
+
+    /* get connection */
+    log_debug("%lx - posting prefetch read", addr);
+    assert(chan_id >= 0 && chan_id < nchans_bkend);
+    conn = &(f->mr->server->dp[chan_id]);
+    assert(conn->datapath);
+
+    /* do we have a free slot? */
+    req_id = conn->read_req_idx;
+    assert(req_id >= 0 && req_id < MAX_R_REQS_PER_CONN_CHAN);
+    if (load_acquire(&conn->read_reqs[req_id].busy))
+        /* all slots busy, try again later */
+        return EAGAIN;
+
+    /* infer remote addr */
+    offset = addr - f->mr->addr;
+    assert(offset < f->mr->size);
+    remote_addr = f->mr->remote_addr + offset;
+    size = CHUNK_SIZE;
+    assert(offset + size <= f->mr->size);
+
+    /* bkend_buf is the caller's, not ours to allocate/free */
+    BUG_ON(bkend_buf == NULL);
+    assert(size <= BACKEND_BUF_SIZE);
+
+    /* take this slot */
+    log_debug("%s - prefetch read request available index=%d", FSTR(f), req_id);
+    conn->read_reqs[req_id].busy = 1;
+    conn->read_reqs[req_id].index = req_id;
+    conn->read_reqs[req_id].local_addr = (unsigned long) bkend_buf;
+    conn->read_reqs[req_id].orig_local_addr = addr;
+    conn->read_reqs[req_id].remote_addr = remote_addr;
+    conn->read_reqs[req_id].lkey = global_ctx->bkend_buf_pool_mr->lkey;
+    conn->read_reqs[req_id].rkey = conn->server->rdmakey;
+    conn->read_reqs[req_id].size = size;
+    conn->read_reqs[req_id].mode = M_PREFETCH;
+    conn->read_reqs[req_id].conn = conn;
+    conn->read_reqs[req_id].mr = f->mr;
+    conn->read_reqs[req_id].evict_prio = f->evict_prio;
+    conn->read_reqs[req_id].fault = NULL;
+
+    /* post read */
+    log_debug("%s - PREFETCH READ remote_addr %lx into local_addr %p, size %lu",
+        FSTR(f), remote_addr, bkend_buf, size);
+    do_rdma_op(&conn->read_reqs[req_id], true);
+
+    /* increment req_id */
+    conn->read_req_idx++;
+    assert(req_id + 1 == conn->read_req_idx); /*no unexpected concurrent reads*/
+    if (conn->read_req_idx >= MAX_R_REQS_PER_CONN_CHAN)
         conn->read_req_idx = 0;
 
     /* success */
@@ -764,6 +842,7 @@ int rdma_check_cq(int chan_id, struct bkend_completion_cbs* cbs, int max_cqe,
     struct ibv_cq *cq;
     int ncqe, r, i;
     enum ibv_wc_opcode opcode;
+    pgflags_t oldflags;
     
     assert(max_cqe > 0 && max_cqe <= RMEM_MAX_COMP_PER_OP);
     assert(chan_id >= 0 && chan_id < nchans_bkend);
@@ -792,21 +871,50 @@ int rdma_check_cq(int chan_id, struct bkend_completion_cbs* cbs, int max_cqe,
             BUG();
         }
         else if (opcode == IBV_WC_RDMA_READ) {
-            /* handle read completion */
+            /* hardware reports the same opcode for a regular read and a
+             * prefetch read (both are RDMA reads) - req->mode (software,
+             * set at post time) is what tells them apart here */
             req = (struct request*)(uintptr_t) wc[i].wr_id;
-            assert(req && req->fault && req->fault->bkend_buf);
-            assert(req->busy);
-            assert(req->size == (1 + req->fault->rdahead) * CHUNK_SIZE);
-            log_debug("%s - RDMA READ completed successfully", FSTR(req->fault));
-           
-            /* call completion hook */
-            r = cbs->read_completion(req->fault);
-            assertz(r);
+            assert(req && req->busy);
 
-            /* release request slot */
-            store_release(&req->busy, 0);
-            RSTAT(NET_READ)++;
-            if (nread)  (*nread)++;
+            if (req->mode == M_PREFETCH) {
+                /* complete the prefetch read: copy the data in, mark the
+                 * page present, free its buf, and release the page lock
+                 * that's been held since is_page_prefetchable() took it
+                 * in page_postfetch(). uses req->mr/evict_prio (captured
+                 * at post time as plain values), never req->fault - the
+                 * fault that triggered the scan may already be long
+                 * freed/recycled */
+                assert(req->mr);
+                log_debug("PREFETCH READ completed successfully, addr: %lx",
+                    req->orig_local_addr);
+
+                prefetch_read_done(req->orig_local_addr,
+                    (void*)req->local_addr, req->mr, req->evict_prio);
+                RSTAT(PREFETCHES)++;
+                clear_page_flags(req->mr, req->orig_local_addr,
+                    PFLAG_WORK_ONGOING, &oldflags);
+                assert(!!(oldflags & PFLAG_WORK_ONGOING));
+
+                /* release request slot */
+                store_release(&req->busy, 0);
+            } else {
+                /* handle regular read completion */
+                assert(req->mode == M_READ);
+                assert(req->fault && req->fault->bkend_buf);
+                assert(req->size == (1 + req->fault->rdahead) * CHUNK_SIZE);
+                log_debug("%s - RDMA READ completed successfully",
+                    FSTR(req->fault));
+
+                /* call completion hook */
+                r = cbs->read_completion(req->fault);
+                assertz(r);
+
+                /* release request slot */
+                store_release(&req->busy, 0);
+                RSTAT(NET_READ)++;
+                if (nread)  (*nread)++;
+            }
         }
         else {
             /* handle write completion */
@@ -845,6 +953,7 @@ struct rmem_backend_ops rdma_backend_ops = {
     .add_memory = rdma_add_regions,
     .remove_region = rdma_free_region,
     .post_read = rdma_post_read,
+    .post_read_prefetch = rdma_post_read_prefetch,
     .post_write = rdma_post_write,
     .check_for_completions = rdma_check_cq,
 };

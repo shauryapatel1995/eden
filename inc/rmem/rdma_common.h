@@ -18,6 +18,7 @@
 enum __rw_mode_t {
     M_WRITE,
     M_READ,
+    M_PREFETCH,
 };
 
 typedef enum __rw_mode_t rw_mode_t;

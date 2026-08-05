@@ -6,7 +6,7 @@
 # Common
 #
 
-INC     = -I./inc
+INC     = -I/home/shaurya/linux/usr/include -I./inc
 CFLAGS  = -g -Wall -std=gnu11 -D_GNU_SOURCE $(INC) -mssse3
 LDFLAGS = -T base/base.ld -no-pie
 LD	= gcc
@@ -202,6 +202,34 @@ XGBOOST_LIB_DIR = $(CURDIR)/tools/fltrace/xgboost_cpu_lib
 XGBOOST_LIBS = -L$(XGBOOST_LIB_DIR) -lxgboost -Wl,-rpath=$(XGBOOST_LIB_DIR)
 XGBOOST_LINK_FLAGS = -Wl,--whole-archive $(XGBOOST_LIBS) -Wl,--no-whole-archive -lstdc++
 endif
+
+# raw pc/pointer-content tracing for collecting prefetcher training data
+# (opt-in: make fltrace.so DO_TRACING=1). dumps one line per fault with its
+# page address, faulting address and pc, plus one line per nonzero pointer
+# candidate found on the faulted page - see benchmarks/ll/README.md.
+ifneq ($(DO_TRACING),)
+CFLAGS += -DDO_TRACING
+endif
+
+# RDMA backend support (opt-in: make fltrace.so RDMA=1). Needed to select
+# FLTRACE_RMEM_BACKEND=rdma at runtime instead of the default local backend.
+# Kept out of the default build: linking -lrdmacm/-libverbs pulls in
+# libnl-3/libnl-route as transitive deps, and something in libnl-route's
+# shared-library destructor (__trans_list_clear) hangs during _dl_fini() on
+# this machine - a pre-existing bug in the system's netlink libraries (or
+# their interaction with glibc's exit path), unrelated to Eden's own code,
+# but it fires on *every* process exit once these libs are linked at all,
+# regardless of whether RDMA is actually used at runtime. Confirmed by
+# building fltrace.so without these libs linked: the exact same LOCAL
+# backend run that hung indefinitely at exit then returned cleanly.
+ifneq ($(RDMA),)
+FLTRACE_RDMA_LIBS = $(RDMA_LIBS)
+# tells fltrace.c's destructor to hard-exit via _exit() after its own
+# cleanup instead of letting the rest of libc's normal destructor chain
+# run, sidestepping the libnl-route hang above. Only needed/applied for
+# RDMA=1 builds - the default build's exit behavior is unaffected.
+CFLAGS += -DRDMA_LINKED
+endif
 endif
 
 tools_src = $(wildcard tools/*/*.c)
@@ -259,11 +287,12 @@ memserver: $(memserver_obj) libbase.a
 	$(LD) $(LDFLAGS) -o $@ $(memserver_obj) libbase.a -lpthread -lm $(RDMA_LIBS)
 
 # fltrace.so has to be built separately as it uses different flags
-# use "make fltrace.so" (add DO_PREFETCH=1 to also build in xgboost)
+# use "make fltrace.so" (add DO_PREFETCH=1 to also build in xgboost, RDMA=1
+# to also build in RDMA backend support)
 $(FLTRACE): $(fltrace_obj) librmem.a libbase.a base/base.ld
 	$(FLTRACE_LD) $(CFLAGS) $(LDFLAGS) -shared $(fltrace_obj) -o $(FLTRACE)	\
 		librmem.a libbase.a $(JEMALLOC_STATIC_LIBS) $(XGBOOST_LINK_FLAGS)	\
-		-lpthread -lm -ldl
+		-lpthread -lm -ldl $(FLTRACE_RDMA_LIBS)
 #-Wl,-Map=fltrace.map
 
 ## tests

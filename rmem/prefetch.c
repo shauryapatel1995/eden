@@ -36,7 +36,7 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
     struct timeval t1, t2;
     double elapsed_time;
 #endif
-    void *local_addr = bkend_buf_alloc();
+    void *bkend_buf;
     pgflags_t oldflags;
     int nprefetches = 0, noverflow = 0;
     unsigned long long pressure;
@@ -83,10 +83,12 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
      * If is_page_prefetchable succeeds, the page is locked.
      * Unlocking needs to be managed by this function.
      * 3. Run inference on page.
-     * 4. Call local post read on the address after making a fault?
-     * Or decide on a design for local post read.
-     * 5. Call fault_read_done for the page.
-     * 6. clear the pages after fetching is done.
+     * 4. Post an async read for the candidate - post_read_prefetch() only
+     * guarantees the read was posted, not that it's done (same contract as
+     * post_read(), see backend.h). Completion - copying the data in,
+     * marking the page present, freeing the backend buf, and clearing
+     * PFLAG_WORK_ONGOING - happens later out of the backend's
+     * check_for_completions(), not inline here.
      */
     for (int i = 0; i < 512; i++) {
         assert(f);
@@ -96,18 +98,25 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
             /* Do the inference to get prediction */
             page_postfetch_preds(&features[i], responses, 1);
             if (responses[0] == 1 && ptr_val != 0) {
-                /* Copy the page into the local buffer from remote */
-                if(rmbackend->post_read_prefetch(chan_id, f, ptr_val, local_addr)) {
+                /* each candidate gets its own buf - freed at its own
+                 * completion, unlike a fault's f->bkend_buf this isn't
+                 * shared/reused across candidates since multiple reads can
+                 * be in flight at once */
+                bkend_buf = bkend_buf_alloc();
+                if (!bkend_buf) {
+                    /* no free backend bufs - prefetching is best-effort,
+                     * so just skip this candidate rather than block/crash */
+                    clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
+                    continue;
+                }
+                if (rmbackend->post_read_prefetch(chan_id, f, ptr_val, bkend_buf)) {
+                    /* backend busy; stop trying more candidates for this
+                     * fault, it'll likely still be busy for the rest */
+                    bkend_buf_free(bkend_buf);
                     clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
                     goto out;
                 }
-                /* Complete prefetch read by copying the page into memory */
-                prefetch_read_done(ptr_val, local_addr, f);
-                RSTAT(PREFETCHES)++;
                 nprefetches++;
-                /* Free the page */
-                clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
-                assert(!!(oldflags & PFLAG_WORK_ONGOING));
             } else {
                 clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
             }
@@ -120,33 +129,36 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
         if(is_page_prefetchable(f, ptr_val)) {
             page_postfetch_preds(&features[i], responses, 1);
             if (responses[0] == 1) {
-                /* Copy the page into a local buffer from remote */
-                if(rmbackend->post_read_prefetch(chan_id, f, ptr_val, local_addr)) {
+                bkend_buf = bkend_buf_alloc();
+                if (!bkend_buf) {
+                    clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
+                    continue;
+                }
+                if (rmbackend->post_read_prefetch(chan_id, f, ptr_val, bkend_buf)) {
+                    bkend_buf_free(bkend_buf);
                     clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
                     goto out;
                 }
-                prefetch_read_done(ptr_val, local_addr, f);
-                RSTAT(PREFETCHES)++;
                 nprefetches++;
-                clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
-                assert(!!(oldflags & PFLAG_WORK_ONGOING));
             } else {
                 clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
             }
         }
     }
 
+out:
     /*
-     * 5. Unmap the pages from the kernel, mark the page as prefetched
-     * in our data structures (Complete after the entire workflow is done).
-     * 6. Calculate/update nevict for the prefetched pages.
+     * book memory pressure for the prefetch reads we just posted (mirrors
+     * how handle_page_fault() accounts pressure right after posting a
+     * regular read, before it completes - see fault.c) and figure out if
+     * evictions are needed. Runs even after an early exit above so
+     * already-posted prefetches from this call are never left unaccounted.
      */
     assert(nevicts_needed);
-    /* book some memory for the pages */
     if (nprefetches > 0) {
         pressure = atomic64_add_and_fetch(&memory_used, nprefetches * CHUNK_SIZE);
-        log_debug("%s - memory pressure during prefetch %llu, limit %lu", FSTR(f),
-            pressure, local_memory);
+        log_debug("%s - memory pressure from %d posted prefetch(es) %llu, "
+            "limit %lu", FSTR(f), nprefetches, pressure, local_memory);
         if (pressure > local_memory) {
             noverflow = (pressure - local_memory) / CHUNK_SIZE;
             *nevicts_needed = (noverflow < nprefetches) ? noverflow : nprefetches;
@@ -156,10 +168,8 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
         if (pressure > atomic64_read(&max_memory_used))
             atomic64_write(&max_memory_used, pressure);
 
-        log_debug("%s - %d page(s) prefetched, pressure %llu evicts %d", FSTR(f),
-            nprefetches, pressure, *nevicts_needed);
+        log_debug("%s - %d prefetch read(s) posted, pressure %llu evicts %d",
+            FSTR(f), nprefetches, pressure, *nevicts_needed);
     }
-out:
-    bkend_buf_free(local_addr);
     return 0;
 }

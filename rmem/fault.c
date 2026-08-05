@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include <stdio.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -199,16 +200,14 @@ int __always_inline get_highest_evict_gen(void)
  * must allocate a new page node to track it and add it to the eviction
  * lists (same as fault_alloc_page_nodes() below, but for a single
  * out-of-band prefetched page rather than the fault's own rdahead range) */
-static inline void prefetch_alloc_page_nodes(unsigned long addr, fault_t* f)
+static inline void prefetch_alloc_page_nodes(unsigned long addr,
+    struct region_t* mr, int prio)
 {
-    int prio;
     struct rmpage_node* pgnode;
     struct list_head new;
     struct page_list* evict_gen;
     pgidx_t pgidx;
 
-    /* prio level */
-    prio = f->evict_prio;
     assert(prio >= 0 && prio < evict_nprio);
 
     list_head_init(&new);
@@ -217,8 +216,8 @@ static inline void prefetch_alloc_page_nodes(unsigned long addr, fault_t* f)
 
     /* each page node gets an MR reference too which gets removed
      * when the page is evicted out */
-    __get_mr(f->mr);
-    pgnode->mr = f->mr;
+    __get_mr(mr);
+    pgnode->mr = mr;
     pgnode->addr = addr;
     pgnode->evict_prio = prio;
     list_add_tail(&new, &pgnode->link);
@@ -352,8 +351,14 @@ static inline void fault_serve_zero_pages(fault_t* f, int nchunks)
     RSTAT(FAULTS_ZP)++;
 }
 
-/* Called after a prefetched page is read from the backend */
-int prefetch_read_done(unsigned long addr, void *bkend_buf, fault_t *f)
+/* Called after a prefetched page is read from the backend. Takes mr/prio
+ * as plain values rather than the fault that triggered the speculative
+ * scan - that fault can (and, once prefetch reads are async, routinely
+ * will) already be freed and recycled for an unrelated fault by the time
+ * its prefetch candidates' reads actually complete, so nothing here may
+ * dereference it */
+int prefetch_read_done(unsigned long addr, void *bkend_buf,
+    struct region_t *mr, int evict_prio)
 {
     int n_retries, r;
     bool wrprotect, no_wake;
@@ -370,13 +375,19 @@ int prefetch_read_done(unsigned long addr, void *bkend_buf, fault_t *f)
     assertz(r);
     RSTAT(UFFD_RETRIES) += n_retries;
 
+    /* free the backend buffer - each prefetch candidate gets its own
+     * (unlike a fault's f->bkend_buf, it's not shared/reused across
+     * candidates), so it's ours to free here, same as fault_read_done()
+     * does for f->bkend_buf */
+    bkend_buf_free(bkend_buf);
+
     /* set page flags */
     flags = PFLAG_PRESENT;
     if (!wrprotect) flags |= PFLAG_DIRTY;
-    set_page_flags_range(f->mr, addr, size, flags);
+    set_page_flags_range(mr, addr, size, flags);
 
     /* add page node for the prefetched page */
-    prefetch_alloc_page_nodes(addr, f);
+    prefetch_alloc_page_nodes(addr, mr, evict_prio);
 
     return 0;
 }
@@ -426,6 +437,29 @@ void fault_done(fault_t* f, int chan_id, int *nevicts_needed)
     /* speculatively prefetch pointer-chase candidates off the page we just
      * finished servicing, before releasing its lock */
     page_postfetch(f, features, responses, chan_id, nevicts_needed);
+#endif
+
+#ifdef DO_TRACING
+    /* dump every nonzero pointer-sized candidate on the page while it's
+     * still locked, for offline ground-truth labeling (was this candidate
+     * actually chased next?) when building prefetcher training data.
+     * present reflects whether the candidate's target page is already
+     * resident (not a prefetch candidate at all) rather than a hardcoded
+     * placeholder - values outside our tracked remote-memory region are
+     * reported as not present since PFLAG_PRESENT is meaningless there */
+    {
+        uint64_t *p = (uint64_t*) f->page;
+        unsigned long candidate_page;
+        int present;
+        for (i = 0; i < 512; i++, p++) {
+            if (*p == 0)
+                continue;
+            candidate_page = *p & ~CHUNK_MASK;
+            present = is_in_memory_region_unsafe(f->mr, candidate_page) &&
+                !!(get_page_flags(f->mr, candidate_page) & PFLAG_PRESENT);
+            fprintf(stderr, "Loc: %d, val: %lx, present:%d\n", i, *p, present);
+        }
+    }
 #endif
 
     /* remove lock (in ascending order) */

@@ -105,6 +105,8 @@ struct request {
     int index;
     struct connection *conn;
     struct fault* fault;
+    struct region_t* mr;    /* only set/used for prefetch requests */
+    int evict_prio;         /* only set/used for prefetch requests */
     unsigned long orig_local_addr;
     unsigned long local_addr;
     unsigned long remote_addr;

@@ -9,6 +9,7 @@
 #endif
 
 #include <ctype.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -59,6 +60,23 @@ static atomic_t rmlib_state = ATOMIC_INIT(NOT_STARTED);
 unsigned long max_memory_mb = 1;
 int shm_id;
 int samples_per_sec = -1;
+static int fltrace_exit_status = 0;
+
+#ifdef RDMA_LINKED
+/* interpose exit() only to capture the real status the process is exiting
+ * with - finish()'s destructor needs it to _exit() with the right code
+ * instead of always reporting success (see finish() for why it hard-exits
+ * at all under RDMA_LINKED). Immediately forwards to the real exit(), so
+ * normal exit() behavior (atexit handlers, destructors) is unaffected up
+ * until finish() itself decides to bypass the rest of them. */
+void exit(int status)
+{
+    void (*real_exit)(int) = dlsym(RTLD_NEXT, "exit");
+    fltrace_exit_status = status;
+    real_exit(status);
+    __builtin_unreachable();
+}
+#endif
 
 /**
  * We need modified versions of logging calls that do not call 
@@ -118,6 +136,18 @@ int parse_env_settings()
 {
     long int val;
     bool local_memory_set;
+    char *backend_str;
+
+    /* parse backend (default: local). rdma_init() reads its own server
+     * info from RDMA_RACK_CNTRL_IP/RDMA_RACK_CNTRL_PORT env vars, so
+     * nothing else needs to change here to point fltrace.so at a remote
+     * memory server instead of local memory */
+    rmbackend_type = RMEM_BACKEND_LOCAL;
+    backend_str = getenv("FLTRACE_RMEM_BACKEND");
+    if (backend_str != NULL && strcmp(backend_str, "rdma") == 0)
+        rmbackend_type = RMEM_BACKEND_RDMA;
+    ft_log_info("using %s rmem backend",
+        (rmbackend_type == RMEM_BACKEND_RDMA) ? "rdma" : "local");
 
     /* parse local memory */
     local_memory_set = false;
@@ -291,10 +321,9 @@ again:
     r = time_init();
     if (r)  goto error;
 
-    /* init rmem (with local backend) */
+    /* init rmem (backend already chosen in parse_env_settings()) */
     ft_log_debug("calling rmem init");
     rmem_enabled = true;
-    rmbackend_type = RMEM_BACKEND_LOCAL;
     eviction_threshold = 1;
     nslabs= max_memory_mb * 1024L * 1024L / RMEM_SLAB_SIZE;
     r = rmem_common_init(nslabs, -1, -1, samples_per_sec);
@@ -761,17 +790,76 @@ static __attribute__((constructor)) void __init__(void)
 
 static __attribute__((destructor)) void finish(void)
 {
+    int i;
+
     ft_log_debug("ftrace destructor");
     /* NOTE: ideally we should free all remote memory resources
-     * with rmem_common_destroy() here but since we assume that 
-     * the program begins in "application" mode rather than in 
-     * "runtime" mode, we send all initial (even before main()) 
-     * allocations to remote memory; hence we need the remote 
-     * memory running even during destroy. */
+     * with rmem_common_destroy() here but since we assume that
+     * the program begins in "application" mode rather than in
+     * "runtime" mode, we send all initial (even before main())
+     * allocations to remote memory; hence we need the remote
+     * memory running even during destroy - so we don't tear down
+     * the backend/regions/allocator here, only the handler threads. */
 
-    /* give a sec for handler and stats threads to empty 
-     * their sample/stat buffers */
-    sleep(1);
+    /* stop and join every handler thread (same as the first step of
+     * rmem_common_destroy()) instead of just sleeping and hoping they're
+     * done: destructors for other shared libraries run right after this
+     * one returns (as part of the same _dl_fini() pass), and a handler
+     * thread can still be mid-completion at any point - e.g. finishing an
+     * in-flight read that was posted but hadn't completed when main()
+     * returned, which under DO_PREFETCH always re-scans the page for new
+     * prefetch candidates and calls into XGBoost. A fixed sleep(1) doesn't
+     * guarantee that's done, and did happen to mask this for years - local
+     * backend reads/prefetches complete near-instantly, so 1 real second
+     * was always enough dead time in practice. RDMA's network latency
+     * breaks that assumption: a completion can genuinely still be in
+     * flight past that window, and if some other library's destructor
+     * (e.g. XGBoost's, or anything it depends on) has already run and torn
+     * down global state that the handler thread then touches, it's a
+     * genuine, silent use-after-free/segfault rather than a merely wasted
+     * sleep. */
+    /* rmem_enabled is set before rmem_common_init() runs and isn't reset
+     * if it later fails (e.g. the backend rejecting the initial memory
+     * request), so handlers can still be NULL here - guard on both */
+    if (rmem_enabled && handlers != NULL) {
+        for (i = 0; i < nhandlers; i++)
+            stop_rmem_handler_thread(handlers[i]);
+
+        /* close the backend connection (e.g. rdma_destroy() tearing down
+         * the RDMA CM connection/QPs) now that nothing is using it - just
+         * the connection, not the rest of rmem (regions/allocator/tcaches
+         * stay up for the same "other destructors may still free() into
+         * rmem" reason as above). */
+        rmbackend->destroy();
+    }
+
+#ifdef RDMA_LINKED
+    /* RDMA=1 builds link -lrdmacm/-libverbs, which pull in libnl-3/
+     * libnl-route as transitive deps. Something in libnl-route's own
+     * shared-library destructor (__trans_list_clear) hangs indefinitely
+     * during _dl_fini() on this machine - confirmed to be a pre-existing
+     * bug in the system's netlink libraries (or their interaction with
+     * glibc's exit path), unrelated to Eden: it reproduces identically
+     * with the local backend as long as these libs are linked at all, and
+     * disappears entirely when they aren't (the non-RDMA default build).
+     * We don't control that library's source, so rather than trying to
+     * fix it, skip the rest of libc's destructor chain outright - we've
+     * already done the cleanup we actually need above (stopped handler
+     * threads, closed the backend connection), and by this point the
+     * application's own output is already flushed (confirmed: it shows up
+     * intact in every run's log, including ones that crashed or hung
+     * later in this exact destructor chain), so there's nothing left to
+     * lose by hard-exiting here instead of letting _dl_fini() continue.
+     *
+     * Uses fltrace_exit_status (captured by the exit() interposition
+     * above) rather than hardcoding 0 - this destructor also runs on
+     * failure paths (e.g. BUG()-triggered aborts from rmem code, which do
+     * go through exit() since init_shutdown()'s call resolves to our own
+     * interposed exit() at link time), and hardcoding 0 would silently
+     * report those as success. */
+    fflush(NULL);
+    _exit(fltrace_exit_status);
+#endif
 
     shmctl(shm_id, IPC_RMID, NULL);
 }

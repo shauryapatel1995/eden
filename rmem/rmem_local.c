@@ -12,6 +12,7 @@
 #include "base/time.h"
 #include "rmem/backend.h"
 #include "rmem/fault.h"
+#include "rmem/page.h"
 #include "rmem/stats.h"
 
 #define LOCAL_BACKEND_DELAY_MUS 0
@@ -29,6 +30,7 @@ struct local_request {
     int chan_id;
     struct fault* fault;
     struct region_t* mr;
+    int evict_prio;     /* only set/used for prefetch requests */
     unsigned long orig_local_addr;
     unsigned long local_addr;
     unsigned long remote_addr;
@@ -211,7 +213,11 @@ int local_post_read_prefetch(int chan_id, fault_t *f,
     BUG_ON(bkend_buf == NULL);     /* not enough bufs */
     assert(size <= BACKEND_BUF_SIZE);
 
-    /* take this slot */
+    /* take this slot. captures mr/evict_prio as plain values rather than
+     * storing f itself - f (the fault that triggered the speculative scan,
+     * not a fault for this candidate) will likely be freed and recycled
+     * for an unrelated fault well before this async read completes, so
+     * nothing at completion time may dereference it */
     log_debug("%s - taking prefetch read slot %d on chan %d", FSTR(f), req_id,
         chan_id);
     chan->read_reqs[req_id].busy = 1;
@@ -221,7 +227,8 @@ int local_post_read_prefetch(int chan_id, fault_t *f,
     chan->read_reqs[req_id].remote_addr = remote_addr;
     chan->read_reqs[req_id].size = size;
     chan->read_reqs[req_id].mr = f->mr;
-    chan->read_reqs[req_id].fault = f;
+    chan->read_reqs[req_id].evict_prio = f->evict_prio;
+    chan->read_reqs[req_id].fault = NULL;
 
     /*** post read - which in case of local backend is just copying the
      * data to the buffer and post a completion ***/
@@ -445,6 +452,7 @@ int local_check_cq(int chan_id, struct bkend_completion_cbs* cbs, int max_cqe,
     int ncqe, r, i, cq_id, req_id;
     spinlock_t* cq_lock;
     unsigned long long duration_tsc;
+    pgflags_t oldflags;
     
     ncqe = 0;
     if(nread)   *nread = 0;
@@ -514,13 +522,27 @@ int local_check_cq(int chan_id, struct bkend_completion_cbs* cbs, int max_cqe,
             if (nread)  (*nread)++;
         }
         else if (wc[i].rwmode == PREFETCH) {
-            /* prefetch reads are completed synchronously inline in
-             * page_postfetch() (see local_post_read_prefetch()) - this cq
-             * entry only exists for read-slot flow control, so just
-             * release the slot */
+            /* complete the prefetch read: copy the data in, mark the page
+             * present, free its buf, and release the page lock that's
+             * been held since is_page_prefetchable() took it in
+             * page_postfetch(). uses req->mr/evict_prio (captured at post
+             * time as plain values), never req->fault - the fault that
+             * triggered the scan may already be long freed/recycled */
             assert(req_id < MAX_R_REQS_PER_CHAN);
             req = &(channels[chan_id]->read_reqs[req_id]);
             assert(req->busy);
+            assert(req->mr);
+            log_debug("PREFETCH READ done, qid: %d, addr: %lx", req_id,
+                req->orig_local_addr);
+
+            prefetch_read_done(req->orig_local_addr, (void*)req->local_addr,
+                req->mr, req->evict_prio);
+            RSTAT(PREFETCHES)++;
+            clear_page_flags(req->mr, req->orig_local_addr,
+                PFLAG_WORK_ONGOING, &oldflags);
+            assert(!!(oldflags & PFLAG_WORK_ONGOING));
+
+            /* release request slot */
             store_release(&req->busy, 0);
         }
         else {

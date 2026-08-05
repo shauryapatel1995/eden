@@ -18,6 +18,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <dlfcn.h>
 #include "rmem/common.h"
@@ -196,6 +197,30 @@ int predict_single(XGBoostModel* model, FeatureVector* features, float* predicti
     }
 
     *prediction = out_result[0];
+
+    /* TEMP DEBUG: check raw feature values reaching the model and the raw
+     * probability it outputs, to see whether pc is sane and whether scores
+     * ever approach the 0.5 threshold */
+    {
+        static _Atomic int __calls = 0;
+        static _Atomic float __max_prob = 0;
+        int n = atomic_fetch_add(&__calls, 1);
+        float prev_max = atomic_load(&__max_prob);
+        while (*prediction > prev_max &&
+               !atomic_compare_exchange_weak(&__max_prob, &prev_max, *prediction))
+            ;
+        if (n < 20) {
+            log_info("TEMP DEBUG: predict#%d pc=%.0f offset=%.0f delta=%.6f "
+                "offset_from_faulting=%.0f prob=%.6f",
+                n, feature_array[FEATURE_PC], feature_array[FEATURE_OFFSET],
+                feature_array[FEATURE_DELTA],
+                feature_array[FEATURE_OFFSET_FROM_FAULTING], *prediction);
+        }
+        if (n > 0 && n % 100000 == 0) {
+            log_info("TEMP DEBUG: %d predictions so far, max prob seen: %.6f",
+                n, atomic_load(&__max_prob));
+        }
+    }
 
     XGDMatrixFree(dtest);
     return 0;

@@ -7,6 +7,7 @@
 #endif
 
 #include <linux/userfaultfd.h>
+#include <stdio.h>
 #include <unistd.h>
 
 #include "base/cpu.h"
@@ -34,6 +35,9 @@ __thread struct hthread *my_hthr = NULL;
 __thread int current_stealing_kthr_id = -1;
 __thread unsigned long current_blocking_page = 0;
 __thread bool current_page_unblocked = false;
+#ifdef DO_TRACING
+int pagefault_index = 0;
+#endif
 
 /* check if a fault already exists in the wait queue */
 bool does_fault_exist_in_wait_q(struct fault *fault)
@@ -183,7 +187,7 @@ static inline fault_t* read_uffd_fault()
     struct uffd_msg message;
     struct fault* fault;
     unsigned long long addr, flags;
-#ifdef UFFD_PC_SUPPORTED
+#if defined(UFFD_PC_SUPPORTED) || defined(DO_TRACING)
     unsigned long pc;
 #endif
     struct region_t* mr;
@@ -221,8 +225,15 @@ static inline fault_t* read_uffd_fault()
         /* new fault */
         addr = message.arg.pagefault.address;
         flags = message.arg.pagefault.flags;
-#ifdef UFFD_PC_SUPPORTED
+#if defined(UFFD_PC_SUPPORTED) || defined(DO_TRACING)
         pc = message.arg.pagefault.pc;
+#endif
+#ifdef DO_TRACING
+        /* one line per fault for offline prefetcher training-data
+         * collection: page address, exact faulting address, and pc */
+        pagefault_index++;
+        fprintf(stderr, "\"%d PF addr, faulting addr, and ip\", %llx %llx %lx\n",
+            pagefault_index, addr & ~CHUNK_MASK, addr, pc);
 #endif
         log_debug("uffd pagefault event %d: addr=%llx, flags=0x%llx",
             message.event, addr, flags);
@@ -267,8 +278,15 @@ static inline fault_t* read_uffd_fault()
             flags |= FSAMPLER_FAULT_FLAG_ZERO;
 
         /* record if sampling faults */
+#ifdef UFFD_PC_SUPPORTED
+        /* the pc-supporting kernel patch repurposes uffd_msg.pagefault's
+         * feat union for the pc field, so the faulting thread id is no
+         * longer available here */
+        fsampler_add_fault_sample(my_hthr->fsampler_id, addr, flags, 0);
+#else
         fsampler_add_fault_sample(my_hthr->fsampler_id, addr, flags,
             message.arg.pagefault.feat.ptid);
+#endif
 #endif
 
         return fault;

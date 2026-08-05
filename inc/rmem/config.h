@@ -143,7 +143,7 @@ BUILD_ASSERT((1 + FAULT_MAX_RDAHEAD_SIZE) <= RMEM_MAX_CHUNKS_PER_OP);
  * out-of-tree kernel patch that adds message.arg.pagefault.pc (NOT the same
  * as kernel/uffd-include-ip.patch, which adds a different field/location) -
  * off by default until that kernel patch lands */
-// #define UFFD_PC_SUPPORTED
+#define UFFD_PC_SUPPORTED
 
 /* fault sampling */
 #define MAX_FAULT_SAMPLERS          (MAX_HANDLER_CORES)
