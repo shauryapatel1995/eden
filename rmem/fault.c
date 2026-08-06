@@ -440,22 +440,31 @@ void fault_done(fault_t* f, int chan_id, int *nevicts_needed)
 #ifdef DO_TRACING
     /* dump every nonzero pointer-sized candidate on the page while it's
      * still locked, for offline ground-truth labeling (was this candidate
-     * actually chased next?) when building prefetcher training data.
-     * present reflects whether the candidate's target page is already
-     * resident (not a prefetch candidate at all) rather than a hardcoded
-     * placeholder - values outside our tracked remote-memory region are
-     * reported as not present since PFLAG_PRESENT is meaningless there */
+     * actually chased next?) when building prefetcher training data. only
+     * candidates that pass is_page_prefetchable() get printed now, so the
+     * trace's population of candidates matches exactly what the runtime
+     * prefetcher would actually be allowed to act on (previously every
+     * nonzero pointer got printed regardless, so training data included a
+     * lot of candidates - already present, unregistered, etc. - that the
+     * runtime gate would've thrown out anyway). is_page_prefetchable()
+     * locks (PFLAG_WORK_ONGOING) any candidate it returns true for; we're
+     * only logging here; not actually prefetching, so release that lock
+     * immediately or it leaks. "present" is always 0 here now since
+     * is_page_prefetchable() already excludes present pages, but kept in
+     * the print format for compatibility with the existing offline
+     * parser */
     {
         uint64_t *p = (uint64_t*) f->page;
         unsigned long candidate_page;
-        int present;
+        pgflags_t oldflags;
         for (i = 0; i < 512; i++, p++) {
             if (*p == 0)
                 continue;
             candidate_page = *p & ~CHUNK_MASK;
-            present = is_in_memory_region_unsafe(f->mr, candidate_page) &&
-                !!(get_page_flags(f->mr, candidate_page) & PFLAG_PRESENT);
-            fprintf(stderr, "Loc: %d, val: %lx, present:%d\n", i, *p, present);
+            if (!is_page_prefetchable(f, candidate_page))
+                continue;
+            clear_page_flags(f->mr, candidate_page, PFLAG_WORK_ONGOING, &oldflags);
+            fprintf(stderr, "Loc: %d, val: %lx, present:%d\n", i, *p, 0);
         }
     }
 #endif

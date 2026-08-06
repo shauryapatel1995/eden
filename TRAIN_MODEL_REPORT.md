@@ -140,6 +140,63 @@ Investigated whether userspace/a kernel module can read the hardware PTE accesse
 
 **Conclusion: real, low-staleness accessed-bit tracking is achievable, but requires patching Eden's own kernel** (already a custom build at `/home/shaurya/linux`, 5.16.0+) with a small new syscall exposing read+clear+flush of the accessed bit for a given (pid, vaddr) — not an out-of-tree module. Cost: kernel patch + rebuild + reinstall + **reboot the machine** (interrupts everything currently running, RDMA connections included). Deliberately not done tonight given that operational cost. **Revisit this** as a scoped follow-up if the staging area's zero-signal design proves to be a real ceiling on further improvement.
 
+## 11. Prev_PC/Prev_delta features, is_page_prefetchable-gated tracing, and separate spatial/pointer models
+
+Follow-up session. Four changes, all interdependent:
+
+1. **Prev_PC/Prev_delta added to the feature set**, computed live in C during tracing/inference (`rmem/handler.c`'s `read_uffd_fault()`, stamped onto `fault_t.prev_pc`/`prev_delta` once per real fault) rather than reconstructed offline: Prev_PC = pc of the immediately preceding real fault; Prev_delta = page-address delta between the 2nd-to-last and last real fault. `FeatureVector` gained matching `prev_pc`/`prev_delta` fields, threaded through both `page_prefetch_spatial()` and `page_postfetch()` in `rmem/prefetch.c`.
+2. **`is_page_prefetchable()` now gates the DO_TRACING pointer-candidate dump** (`rmem/fault.c`'s `Loc:` lines) - only candidates the runtime could actually act on get printed (immediately releasing the lock again since tracing doesn't post a real prefetch), instead of every nonzero pointer regardless of registration/present/lock state. This matches training data population to the real runtime-filtered population.
+3. **Two bugs found and fixed along the way:**
+   - **4096x delta double-scaling.** `prefetch.c` already sets spatial `delta` in page-count units (1,2,3,4) matching training's `Cand_delta/4096`, but both `xgboost_prefetcher.c`'s `preprocess_features()` and `native_prefetch_predict.c` divided by 4096 *again* before inference - collapsing 1..4 down to ~0.0002..0.001, values the trained trees' split thresholds never saw. This almost certainly explains an unresolved finding from the prior session ("deployed F0.5 model predicts positive on zero of 4.26M gated spatial candidates") - pointer candidates were unaffected since their `delta` is unconditionally 0 either way. Fixed by removing the redundant division in both places.
+   - **Denominator mismatch when splitting into separate models.** Spatial candidates have a mild ~6:1 miss:hit imbalance; pointer candidates have a much more severe ~1400:1 imbalance. Reusing the old combined-dataset-tuned `scale_denominator=400` on the spatial-only subset drove `scale_pos_weight` down to 0.015 - the spatial model predicted positive on **zero** held-out candidates. Fixed with a dedicated spatial-only sweep (see below); the old combined dataset had turned out to be pointer-dominated (168M pointer rows vs 11M spatial rows raw), so its tuning was implicitly pointer-only all along and never actually validated spatial's own optimum.
+4. **Trained separate spatial and pointer models** (`scratchpad/train_filtered_dual.py`, `scratchpad/sweep_spatial.py`) on a freshly-recollected trace (`/data1/shaurya/deku_mcf/mcf-train-trace-v2.csv`, 3,468,372 real faults, 182.9M is_page_prefetchable-gated candidate rows - much smaller than the old 929M-row ungated trace) with the new Prev_PC/Prev_delta features:
+
+| Model | scale_pos_weight | precision | recall | F0.5 |
+|---|---|---|---|---|
+| Pointer (denom=400) | 3.52 | **70.11%** | 77.06% | - |
+| Spatial (dedicated sweep, denom=4.04) | 1.5 | 48.52% | 63.24% | 0.5089 |
+
+Pointer precision/recall (70%/77%) is a large jump over the old unified model's 48%/64-67% - likely from a combination of the new Prev_PC/Prev_delta signal, the delta-scaling fix, and training on the is_page_prefetchable-gated population. Spatial, previously silently dead (0 positives, see bug above), is now a real, separately-tunable model.
+
+**Runtime dual-model dispatch** (previously the native/libxgboost path only had ONE compiled-in model shared by both candidate types): `page_prefetch_preds()` (declared but stubbed since forever, `return 0;`) is now implemented and wired to `page_prefetch_spatial()` in place of the previous `page_postfetch_preds()` reuse. `native_prefetch_predict.c` split into `native_predict_spatial.c`/`native_predict_pointer.c` (separate translation units, each `#include`-ing its own generated `native_tree_model_{spatial,pointer}.h` - `static` symbols avoid link collisions), and `xgboost_prefetcher.c` gained a second `global_spatial_model`/`EDEN_PREFETCH_SPATIAL_MODEL_PATH` for the non-native libxgboost path, mirroring the existing single-model pattern.
+
+**First benchmark result - local backend, train dataset, dual model (NATIVE_ONLY): a severe regression, despite the good offline metrics above.** Wall clock 5m10.260s (vs 1m52.196s prior-session staging-v1 baseline), faults_done 5,481,784, prefetched_pages 23,206,390 (79x the old unified model's 293,592). Investigating this regression is what surfaced three feature-serving bugs (see below) - the model was never actually seeing what it was trained on.
+
+**Three more bugs found while investigating, all in how runtime features were fed to the model (not the training data, which was already correct) - user specifically asked "are you giving the models the same features at runtime as training time":**
+
+1. **Pointer model's `Cand_delta` hardcoded to 0 at runtime.** Training used the real candidate-pointer offset (`pointer_page - curr_faulting_page`, drives ~20% of the pointer model's splits) - a stale comment claimed "trained with delta zeroed for pointer-type candidates," true of an old, since-reverted design, never updated when the data pipeline changed. Fixed: `page_postfetch()` now computes the real offset from the already-read pointer value (`(ptr_val - f->page) / CHUNK_SIZE`, signed).
+2. **Spatial model's `Offset_from_faulting` hardcoded to 0 at runtime.** Training computed a real, varying value (`-1 - curr_faulting_offset`, the single biggest driver of the spatial model's splits at ~35%). Fixed: `page_prefetch_spatial()` now computes it from `f->faulting_addr`/`f->page`, matching training exactly.
+3. **`FeatureVector.pc`/`prev_pc` declared `uint32_t`**, but real PCs are ~47-bit values (e.g. `0x7ffff579288d` ≈ 1.4x10^14) - training used the full value as float64, so truncating to the low 32 bits at runtime fed the model a completely different number than it learned to split on. `pc`'s truncation predates this session; `prev_delta`'s sibling `prev_pc` inherited the same (wrong) pattern when added this session. Fixed: widened both to `uint64_t`.
+
+All three verified end-to-end before AND after the fix (model JSON `feature_names`/`num_feature`, per-feature split-usage counts via `booster.get_dump()`, and matching counts in the compiled `native_tree_model_{spatial,pointer}.h` headers - all three lines of evidence agreed).
+
+**Re-benchmark after fixing all three - the real result:**
+
+| Metric | No-prefetch baseline | Prior-session F0.5 unified + staging v1 | Dual model, **broken features** | Dual model, **fixed features** |
+|---|---|---|---|---|
+| Wall clock | 1m31.651s | 1m52.196s | 5m10.260s | **1m45.540s** |
+| faults_done | 3,460,551 | 3,460,542 | 5,481,784 | **2,951,217** (below baseline) |
+| prefetched_pages | - | 293,592 | 23,206,390 | **346,430** |
+| net_reads | 2,051,664 | 2,040,750 | 3,858,646 | **1,540,092** (below baseline) |
+| evict_madv | 2,430,328 (approx., see §9 table) | - | 27,187,818 | **2,011,518** |
+| staging_aged_out | - | - | 5,625,525 | **4,056** |
+
+With correct features, the model is genuinely selective (346K prefetches, not 23.2M) and net-positive: **both real page faults and net_reads land below the no-prefetch baseline** - the first config all session to actually beat baseline on both, not just avoid regressing - for ~15% wall-clock overhead versus baseline, and better wall-clock than the prior session's best (staging v1, 1m52s). The earlier "denom mismatch"/"volume overwhelms staging" hypothesis was real but was compounding on top of the feature bugs, not the primary cause - fixing the features alone (same models, same staging config, no retuning) resolved the great majority of the regression.
+
+**RDMA re-benchmark (same fixed binary, `RDMA=1` relink, connecting to the smarties10 memserver): confirms the local result, not backend-specific.**
+
+| Metric | RDMA no-prefetch (prior session) | RDMA F0.5 unified + staging v1 (prior session) | **RDMA fixed dual model (this session)** |
+|---|---|---|---|
+| Wall clock | 1m56.503s | 2m11.698s | **2m01.630s** |
+| faults_done | 3,468,854 | 3,470,724 | **2,959,558** (below baseline) |
+| net_reads | - | - | **1,541,872** |
+| prefetched_pages | - | - | **338,715** |
+| staging_aged_out | - | - | **6,867** |
+
+Same story as local: real faults land below the no-prefetch baseline (2.96M vs 3.47M), and wall clock beats the prior session's best RDMA staging result (2m01.6s vs 2m11.7s) - only ~4% slower than the no-prefetch baseline itself. The feature-serving fix generalizes cleanly across backends; this isn't a local-only artifact.
+
+Code has NOT been committed yet.
+
 ## Artifacts
 
 - Cleaned dataset: `/data1/shaurya/deku_mcf/mcf-train-trace-clean.parquet`
@@ -152,3 +209,15 @@ Investigated whether userspace/a kernel module can read the hardware PTE accesse
 - Code changes (not yet committed): `tools/fltrace/xgboost_prefetcher.c` (native-mode libxgboost skip fixes), `Makefile` (`NATIVE_ONLY=1` build flag), `rmem/eviction.c`/`inc/rmem/eviction.h`/`rmem/fault.c` (prefetch staging area), `inc/rmem/config.h` (`PREFETCH_STAGING_MAX_PAGES`), `inc/rmem/stats.h`/`rmem/stats.c` (`staging_aged_out` counter)
 - Staging-enabled builds: `/home/shaurya/eden/fltrace_prefetch_f05_staging.so` (local, v1 8MB design), `/home/shaurya/eden/fltrace_rdma_prefetch_f05_staging.so` (RDMA, v1), `/home/shaurya/eden/fltrace_prefetch_f05_staging64mb.so` (local, v2 64MB design - reverted, kept only for reference)
 - Kernel module scratch work (accessed-bit investigation, not integrated): `/tmp/claude-1005/-home-shaurya-eden/dfb21282-c741-4693-addb-3df11ff6cb4a/scratchpad/acctest/` (out-of-tree module proving the TLB-flush restriction; not useful as-is since it can't flush)
+
+### §11 artifacts (Prev_PC/Prev_delta, dual spatial/pointer models)
+
+- New trace (is_page_prefetchable-gated, Prev_PC/Prev_delta on every line): `/data1/shaurya/deku_mcf/mcf-train-trace-v2.csv` (186,333,678 lines, 3,468,372 real faults)
+- Processed training CSV: `/data1/shaurya/deku_mcf/mcf-train-trace-v2-processed.csv` (186,243,889 rows; new columns `Cand_delta`/`Prev_delta`/`Delta` replace the old, partly-mislabeled `Delta`/`Prev_delta` pair - see `process_linux_trace.py`)
+- Trained models: `/data1/shaurya/deku_mcf/models_out_train_v2/mcf-test-trace_{spatial,pointer}_filtered.json`
+- Native tree headers: `/home/shaurya/eden/tools/fltrace/native_tree_model_{spatial,pointer}.h` (also copied to `/data1/shaurya/deku_mcf/models_out_train_v2/`)
+- Dual-model NATIVE_ONLY build, **broken features** (first, regressing benchmark): `/data1/shaurya/deku_mcf/fltrace_dual_native.so` - log `mcf_train_local_prefetch_dual.log`, stats `fault-stats-161763.out`
+- Dual-model NATIVE_ONLY build, **fixed features** (local backend): `/data1/shaurya/deku_mcf/fltrace_dual_native_fixed.so` - log `mcf_train_local_prefetch_dual_fixed.log`, stats `fault-stats-164308.out`
+- Dual-model NATIVE_ONLY+RDMA build, **fixed features** (RDMA backend): `/data1/shaurya/deku_mcf/fltrace_dual_native_fixed_rdma.so` - log `mcf_train_rdma_prefetch_dual_fixed.log`, stats `fault-stats-165599.out`
+- Training/sweep scripts: `/tmp/claude-1005/-home-shaurya-eden/dfb21282-c741-4693-addb-3df11ff6cb4a/scratchpad/train_filtered_dual.py`, `sweep_spatial.py`
+- Code changes (not yet committed): `inc/rmem/fault.h` (`prev_pc`/`prev_delta` on `fault_t`), `inc/rmem/prefetch.h` (`FeatureVector` fields widened to `uint64_t` pc/prev_pc, `page_prefetch_preds()` signature), `rmem/handler.c` (running prev-fault state, extended DO_TRACING line format), `rmem/fault.c` (`is_page_prefetchable()`-gated `Loc:` dump), `rmem/prefetch.c` (feature setup incl. the three runtime-vs-training fixes, spatial now calls `page_prefetch_preds()`), `tools/fltrace/xgboost_prefetcher.c` (dual-model dispatch, delta-scaling fix), `tools/fltrace/native_predict_{spatial,pointer}.c` (replaces `native_prefetch_predict.c`), `tools/fltrace/gen_tree_code.py` (`Prev_PC`/`Prev_delta` feature indices), `~/pointer_analysis/deku/trace_processing/{DataClasses,process_linux_trace}.py` (new trace format, `Cand_delta` rename)

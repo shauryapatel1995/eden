@@ -38,6 +38,19 @@ __thread bool current_page_unblocked = false;
 #ifdef DO_TRACING
 int pagefault_index = 0;
 #endif
+#if defined(DO_TRACING) || defined(DO_PREFETCH)
+/* running state for prev_pc/prev_delta, updated once per real fault right
+ * where it's created below - single handler thread owns this, same
+ * RMEM_STANDALONE reasoning as elsewhere in this file (no cross-thread
+ * fault stealing in our build, see handle_page_fault()) */
+static unsigned long trace_last_pc = 0;
+static unsigned long trace_last_page = 0;
+static long trace_last_delta = 0;
+static bool trace_have_last = false;   /* false until the first real fault
+                                          * has been seen - avoids a bogus
+                                          * huge "delta" (this_page - 0) on
+                                          * that very first fault */
+#endif
 
 /* check if a fault already exists in the wait queue */
 bool does_fault_exist_in_wait_q(struct fault *fault)
@@ -188,8 +201,13 @@ static inline fault_t* read_uffd_fault()
     struct fault* fault;
     unsigned long long addr, flags;
     unsigned long fault_create_tsc;
-#if defined(UFFD_PC_SUPPORTED) || defined(DO_TRACING)
+#if defined(UFFD_PC_SUPPORTED) || defined(DO_TRACING) || defined(DO_PREFETCH)
     unsigned long pc;
+#endif
+#if defined(DO_TRACING) || defined(DO_PREFETCH)
+    unsigned long this_page;
+    unsigned long prev_pc_snapshot;
+    long prev_delta_snapshot;
 #endif
     struct region_t* mr;
 
@@ -231,15 +249,34 @@ static inline fault_t* read_uffd_fault()
         /* new fault */
         addr = message.arg.pagefault.address;
         flags = message.arg.pagefault.flags;
-#if defined(UFFD_PC_SUPPORTED) || defined(DO_TRACING)
+#if defined(UFFD_PC_SUPPORTED) || defined(DO_TRACING) || defined(DO_PREFETCH)
         pc = message.arg.pagefault.pc;
+#endif
+#if defined(DO_TRACING) || defined(DO_PREFETCH)
+        /* snapshot prev state before overwriting it with this fault's own
+         * values - prev_pc_snapshot/prev_delta_snapshot are what get handed
+         * to this fault (both for tracing and, further below, fault->prev_pc/
+         * prev_delta); trace_last_* then get updated to reflect this fault so
+         * the *next* fault sees these as its "prev" */
+        this_page = addr & ~CHUNK_MASK;
+        prev_pc_snapshot = trace_last_pc;
+        prev_delta_snapshot = trace_last_delta;
+        trace_last_delta = trace_have_last ?
+            (long)(this_page - trace_last_page) : 0;
+        trace_last_page = this_page;
+        trace_last_pc = pc;
+        trace_have_last = true;
 #endif
 #ifdef DO_TRACING
         /* one line per fault for offline prefetcher training-data
-         * collection: page address, exact faulting address, and pc */
+         * collection: page address, exact faulting address, pc, pc of the
+         * immediately preceding real fault, page-delta between the
+         * 2nd-to-last and last real fault, and page-delta between this
+         * fault and the last one */
         pagefault_index++;
-        fprintf(stderr, "\"%d PF addr, faulting addr, and ip\", %llx %llx %lx\n",
-            pagefault_index, addr & ~CHUNK_MASK, addr, pc);
+        fprintf(stderr, "\"%d PF addr, faulting addr, and ip\", %lx %llx %lx %lx %ld %ld\n",
+            pagefault_index, this_page, addr, pc,
+            prev_pc_snapshot, prev_delta_snapshot, trace_last_delta);
 #endif
         log_debug("uffd pagefault event %d: addr=%llx, flags=0x%llx",
             message.event, addr, flags);
@@ -258,6 +295,10 @@ static inline fault_t* read_uffd_fault()
         fault->create_tsc = fault_create_tsc;
 #ifdef UFFD_PC_SUPPORTED
         fault->pc = pc;
+#endif
+#if defined(DO_TRACING) || defined(DO_PREFETCH)
+        fault->prev_pc = prev_pc_snapshot;
+        fault->prev_delta = prev_delta_snapshot;
 #endif
         fault->is_wrprotect = !!(flags & UFFD_PAGEFAULT_FLAG_WP);
         fault->is_write = !!(flags & UFFD_PAGEFAULT_FLAG_WRITE);

@@ -109,15 +109,28 @@ void page_prefetch_spatial(fault_t *f, int chan_id)
     uint64_t ptr_val[4];
     int ncandidates = 0;
     unsigned long pass_start_tsc;
+    /* matches process_linux_trace.py's curr_faulting_offset: in-page offset
+     * of the faulting address itself, in 8-byte units - same formula as
+     * page_postfetch()'s faulting_location below */
+    int faulting_location = (f->faulting_addr - f->page) / sizeof(uint64_t);
 
     unsigned long spatial_start_tsc = rdtsc();
 
-    /* Setup next-N features - pure address arithmetic, no page content */
+    /* Setup next-N features - pure address arithmetic, no page content.
+     * offset/offset_from_faulting match training's check_spatial(), which
+     * uses a constant offset=-1 (no real per-candidate pointer location
+     * for spatial candidates) - offset_from_faulting is NOT constant there
+     * (offset - curr_faulting_offset = -1 - curr_faulting_offset, which
+     * varies with where exactly the fault landed on its page) and drives
+     * ~35% of the trained spatial model's splits, so it must be computed
+     * for real here too, not hardcoded to 0 */
     for (int i = 0; i < 4; i++) {
         features[i].pc = f->pc;
-        features[i].offset = 0;
+        features[i].offset = -1;
         features[i].delta = i + 1;
-        features[i].offset_from_faulting = 0;
+        features[i].offset_from_faulting = -1 - faulting_location;
+        features[i].prev_pc = f->prev_pc;
+        features[i].prev_delta = (float) f->prev_delta / CHUNK_SIZE;
     }
 
     pass_start_tsc = rdtsc();
@@ -134,7 +147,7 @@ void page_prefetch_spatial(fault_t *f, int chan_id)
     pass_start_tsc = rdtsc();
     RSTAT(PREFETCH_SPATIAL_CANDIDATES_GATED) += ncandidates;
     if (ncandidates > 0)
-        page_postfetch_preds(features, responses, ncandidates);
+        page_prefetch_preds(features, responses, ncandidates);
     for (int k = 0; k < ncandidates; k++)
         if (responses[k] == 1)
             RSTAT(PREFETCH_SPATIAL_CANDIDATES_POSITIVE)++;
@@ -175,26 +188,22 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
     int ncandidates = 0;
 
     assert(f->page);
-    /* Setup pointer features. delta is intentionally NOT computed here
-     * (would be (*ptr - f->page) / 4096) - the model was trained with
-     * delta zeroed for pointer-type candidates specifically because that
-     * was the one feature that required reading the actual pointer value
-     * off the faulted page. We tried overlapping inference with the real
-     * read using that property (page_prefetch_prescan(), since reverted)
-     * but it was a net loss on both LOCAL and RDMA backends: without
-     * is_page_prefetchable()'s cheap real-pointer-value gate available
-     * before the read completes, prescan had to score all 516 candidates
-     * unconditionally (~200us/fault), which is far more than the RDMA
-     * round-trip it was meant to hide behind (~10us/fault) - so gating
-     * first and only inferring on the (usually much smaller) surviving
-     * subset, as below, wins in practice despite still running after the
-     * read. */
+    /* Setup pointer features. delta can't be filled in here yet (would be
+     * (*ptr - f->page) / CHUNK_SIZE) - it needs the real pointer value off
+     * the faulted page, which Pass 1 below reads anyway to compute ptr_val
+     * for is_page_prefetchable(), so it's filled in there instead, once per
+     * candidate, right after ptr_val is known (see Cand_delta in
+     * process_linux_trace.py's collect_pointers() - training used the real
+     * candidate offset, not a placeholder, so this must match at inference
+     * too or ~20% of the pointer model's splits - the fraction that split
+     * on Cand_delta - see meaningless, always-0 input) */
     for(int i = 0; i < 512; i++) {
         FeatureVector *feature = &features[i];
         feature->pc = f->pc;
         feature->offset = i;
-        feature->delta = 0;
         feature->offset_from_faulting = i - faulting_location;
+        feature->prev_pc = f->prev_pc;
+        feature->prev_delta = (float) f->prev_delta / CHUNK_SIZE;
         responses[i] = 0;
     }
 
@@ -213,6 +222,7 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
         uint64_t ptr_val = *((uint64_t *) f->page + i);
         ptr_val = ptr_val & ~CHUNK_MASK;
         if (is_page_prefetchable(f, ptr_val)) {
+            features[i].delta = (float)((int64_t)ptr_val - (int64_t)f->page) / CHUNK_SIZE;
             compact_features[ncandidates] = features[i];
             compact_ptr_val[ncandidates] = ptr_val;
             ncandidates++;

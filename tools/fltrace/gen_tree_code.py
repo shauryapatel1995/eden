@@ -5,8 +5,10 @@ import math
 
 MODEL_PATH = sys.argv[1]
 OUT_PATH = sys.argv[2]
+KEEP_PCS_PATH = sys.argv[3] if len(sys.argv) > 3 else None
 
-FEATURE_INDEX = {'PC': 0, 'Offset': 1, 'Delta': 2, 'Offset_from_faulting': 3}
+FEATURE_INDEX = {'PC': 0, 'Offset': 1, 'Cand_delta': 2, 'Offset_from_faulting': 3,
+                  'Prev_PC': 4, 'Prev_delta': 5}
 
 booster = xgb.Booster()
 booster.load_model(MODEL_PATH)
@@ -97,4 +99,18 @@ with open(OUT_PATH, 'w') as f:
 
     f.write("static const float native_base_score = %s;\n" % fmt_float(base_score))
 
-print(f"wrote {OUT_PATH}: {len(all_nodes)} nodes across {num_trees} trees", file=sys.stderr)
+    if KEEP_PCS_PATH:
+        with open(KEEP_PCS_PATH) as kf:
+            keep_pcs = sorted(json.load(kf))
+        f.write("\n/* PCs the training data actually had >=100 real cache hits for -\n")
+        f.write(" * see %s. Candidates from any other PC are extrapolating outside\n" % KEEP_PCS_PATH)
+        f.write(" * the training distribution for this feature - skip the full tree\n")
+        f.write(" * ensemble for them entirely (native_pc_is_relevant() below, binary\n")
+        f.write(" * search since this array is kept sorted). */\n")
+        f.write("#define NATIVE_NUM_RELEVANT_PCS %d\n" % len(keep_pcs))
+        f.write("static const uint64_t native_relevant_pcs[NATIVE_NUM_RELEVANT_PCS] = {\n    ")
+        f.write(", ".join("0x%xULL" % pc for pc in keep_pcs))
+        f.write("\n};\n")
+
+print(f"wrote {OUT_PATH}: {len(all_nodes)} nodes across {num_trees} trees" +
+      (f", {len(keep_pcs)} relevant PCs" if KEEP_PCS_PATH else ""), file=sys.stderr)

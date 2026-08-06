@@ -42,6 +42,14 @@ typedef struct fault {
     unsigned long page;
     uint64_t faulting_addr;     /* actual faulting addr (used by prefetcher) */
     uint64_t pc;                /* faulting pc (used by prefetcher) */
+    uint64_t prev_pc;           /* pc of the immediately preceding real fault
+                                  * (used by prefetcher; stamped once when the
+                                  * fault is created in handler.c, unconditional
+                                  * like the fields above - see prefetch_fault_counter
+                                  * comment in common.h for why we don't gate
+                                  * fields like this behind DO_PREFETCH) */
+    int64_t prev_delta;         /* page-address delta between the 2nd-to-last
+                                  * and last real fault (used by prefetcher) */
     struct region_t* mr;
     thread_t* thread;
     void* bkend_buf;
@@ -51,7 +59,7 @@ typedef struct fault {
                                  * blocks on real (from_kernel) page faults */
 
 	struct list_node link;
-    uint8_t cacheline_padding[128 - 88]; /* pad fault_t to 2 cache lines */
+    uint8_t cacheline_padding[128 - 104]; /* pad fault_t to 2 cache lines */
 } fault_t;
 BUILD_ASSERT(sizeof(fault_t) % CACHE_LINE_SIZE == 0);
 BUILD_ASSERT(FAULT_MAX_RDAHEAD_SIZE <= UINT8_MAX);   /* due to rdahead */

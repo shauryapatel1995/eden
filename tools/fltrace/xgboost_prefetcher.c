@@ -43,20 +43,28 @@
 #define FEATURE_OFFSET 1
 #define FEATURE_DELTA 2
 #define FEATURE_OFFSET_FROM_FAULTING 3
-#define NUM_FEATURES 4
+#define FEATURE_PREV_PC 4
+#define FEATURE_PREV_DELTA 5
+#define NUM_FEATURES 6
 
 typedef struct {
     BoosterHandle booster;
     int is_loaded;
 } XGBoostModel;
 
+/* global_model serves pointer-chase (Type=1) candidates; global_spatial_model
+ * serves spatial/next-N (Type=0) candidates - separate models, see
+ * native_predict_pointer.c's header comment for why */
 static XGBoostModel* global_model = NULL;
+static XGBoostModel* global_spatial_model = NULL;
 static pthread_mutex_t model_init_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define XGBOOST_LIB_PATH_ENV "EDEN_PREFETCH_XGBOOST_LIB_PATH"
 #define XGBOOST_LIB_PATH_DEFAULT "/usr/local/lib/libxgboost.so"
 #define XGBOOST_MODEL_PATH_ENV "EDEN_PREFETCH_MODEL_PATH"
 #define XGBOOST_MODEL_PATH_DEFAULT "./eden_xgboost_model.json"
+#define XGBOOST_SPATIAL_MODEL_PATH_ENV "EDEN_PREFETCH_SPATIAL_MODEL_PATH"
+#define XGBOOST_SPATIAL_MODEL_PATH_DEFAULT "./eden_xgboost_spatial_model.json"
 #define NATIVE_MODEL_ENV "EDEN_PREFETCH_NATIVE_MODEL"
 
 /* cached once - checked before doing anything that would touch libxgboost */
@@ -178,8 +186,12 @@ void preprocess_features(FeatureVector* features) {
     // Convert PC to categorical (in training, PC was converted to category)
     // For inference, we keep PC as-is since XGBoost handles categorical features
 
-    // Scale delta by 4096 (as done in training)
-    features->delta = features->delta / 4096.0f;
+    // delta and prev_delta already arrive in page-count units (see
+    // page_prefetch_spatial()/page_postfetch() in prefetch.c) matching
+    // training's Cand_delta/Prev_delta (divided by 4096 there) - do NOT
+    // divide again here (a previous version of this function did, a 4096x
+    // double-scale that likely explains why the deployed spatial model
+    // never predicted positive on any of its candidates)
 }
 
 /* config for XGBoosterPredictFromDense: normal prediction, all trees, no
@@ -217,6 +229,8 @@ int predict_batch(XGBoostModel* model, FeatureVector* features_batch,
         feature_matrix[base_idx + FEATURE_OFFSET] = (float)temp_features.offset;
         feature_matrix[base_idx + FEATURE_DELTA] = temp_features.delta;
         feature_matrix[base_idx + FEATURE_OFFSET_FROM_FAULTING] = (float)temp_features.offset_from_faulting;
+        feature_matrix[base_idx + FEATURE_PREV_PC] = (float)temp_features.prev_pc;
+        feature_matrix[base_idx + FEATURE_PREV_DELTA] = temp_features.prev_delta;
     }
 
     /* Inplace prediction directly from feature_matrix - no DMatrix
@@ -338,28 +352,48 @@ void init_prefetcher() {
     const char* model_path = getenv(XGBOOST_MODEL_PATH_ENV);
     if (!model_path)
         model_path = XGBOOST_MODEL_PATH_DEFAULT;
+    const char* spatial_model_path = getenv(XGBOOST_SPATIAL_MODEL_PATH_ENV);
+    if (!spatial_model_path)
+        spatial_model_path = XGBOOST_SPATIAL_MODEL_PATH_DEFAULT;
 
     pthread_mutex_lock(&model_init_lock);
 
     // Check if already initialized
-    if (global_model != NULL && global_model->is_loaded) {
+    if (global_model != NULL && global_model->is_loaded &&
+        global_spatial_model != NULL && global_spatial_model->is_loaded) {
         pthread_mutex_unlock(&model_init_lock);
         return;
     }
 
-    log_info("initializing prefetcher, model path: %s", model_path);
+    log_info("initializing prefetcher, pointer model path: %s, spatial model path: %s",
+        model_path, spatial_model_path);
 
     global_model = init_model();
     if (!global_model) {
-        log_err("prefetch model structure allocation failed");
+        log_err("pointer prefetch model structure allocation failed");
         pthread_mutex_unlock(&model_init_lock);
         return;
     }
 
     if (load_model(global_model, model_path) != 0) {
-        log_err("prefetch model loading failed");
+        log_err("pointer prefetch model loading failed");
         free_model(global_model);
         global_model = NULL;
+        pthread_mutex_unlock(&model_init_lock);
+        return;
+    }
+
+    global_spatial_model = init_model();
+    if (!global_spatial_model) {
+        log_err("spatial prefetch model structure allocation failed");
+        pthread_mutex_unlock(&model_init_lock);
+        return;
+    }
+
+    if (load_model(global_spatial_model, spatial_model_path) != 0) {
+        log_err("spatial prefetch model loading failed");
+        free_model(global_spatial_model);
+        global_spatial_model = NULL;
         pthread_mutex_unlock(&model_init_lock);
         return;
     }
@@ -370,14 +404,37 @@ void init_prefetcher() {
 }
 
 /*
- * This function is run before the page is fetched.
- * It can do prefetching based on non-page content related
- * information.
+ * This function is run before the page is fetched (spatial/next-N
+ * candidates only - see page_prefetch_spatial() in prefetch.c). Routes to
+ * the spatial-specific model, not the pointer-chase one below.
  * Features: input features computed at pagefault.
  * Reponse arr: Output predictions.
  */
-unsigned long page_prefetch_preds(FeatureVector features[], int *response_arr) {
+unsigned long page_prefetch_preds(FeatureVector features[], int *response_arr, int batch_size) {
+#ifdef NATIVE_ONLY
+    return native_predict_batch_spatial(features, batch_size, response_arr);
+#else
+    if (native_mode_enabled())
+        return native_predict_batch_spatial(features, batch_size, response_arr);
+
+    float probs[batch_size];
+
+    if (!global_spatial_model || !global_spatial_model->is_loaded) {
+        log_warn_ratelimited("spatial prefetch model not initialized, call init_prefetcher() first");
+        return 1;
+    }
+
+    if (predict_batch(global_spatial_model, features, batch_size, probs) != 0) {
+        fprintf(stderr, "Spatial batch prediction failed\n");
+        memset(response_arr, 0, batch_size * sizeof(*response_arr));
+        return 1;
+    }
+
+    for (int i = 0; i < batch_size; i++)
+        response_arr[i] = probability_to_prediction(probs[i]);
+
     return 0;
+#endif
 }
 
 /*
@@ -389,12 +446,12 @@ unsigned long page_prefetch_preds(FeatureVector features[], int *response_arr) {
  */
 unsigned long page_postfetch_preds(FeatureVector features[], int *response_arr, int batch_size) {
     /* native path: hand-compiled tree evaluator baked in at build time from
-     * native_tree_model.h, no DMatrix/JSON/libxgboost call at all */
+     * native_tree_model_pointer.h, no DMatrix/JSON/libxgboost call at all */
 #ifdef NATIVE_ONLY
-    return native_predict_batch(features, batch_size, response_arr);
+    return native_predict_batch_pointer(features, batch_size, response_arr);
 #else
     if (native_mode_enabled())
-        return native_predict_batch(features, batch_size, response_arr);
+        return native_predict_batch_pointer(features, batch_size, response_arr);
 
     float probs[batch_size];
 
