@@ -181,11 +181,23 @@ CFLAGS += -DFAULT_SAMPLER
 # page-fault profiling tool with no reason to need xgboost).
 ifneq ($(DO_PREFETCH),)
 CFLAGS += -DDO_PREFETCH
+FLTRACE_LD = g++
+ifneq ($(NATIVE_ONLY),)
+# opt-in: make fltrace.so DO_PREFETCH=1 NATIVE_ONLY=1. Skips linking
+# libxgboost entirely - the native hand-compiled tree evaluator
+# (native_prefetch_predict.c) never calls a single xgboost function, but
+# merely having libxgboost.so linked as a DT_NEEDED dependency is enough for
+# the dynamic linker to run its global C++ destructors (e.g.
+# dmlc::Registry::~Registry()) at process exit via _dl_fini() - and that
+# destructor path can itself hang, even though nothing in this process ever
+# called into xgboost. Not linking it at all is the only way to avoid that
+# hang while still getting a clean, checksum-verifiable process exit.
+CFLAGS += -DNATIVE_ONLY
+else
 # c_api.h isn't shipped by any xgboost pip wheel, so a copy (matching the
 # linked library's version) is vendored here instead of requiring a system
 # libxgboost-dev.
 CFLAGS += -I$(CURDIR)/tools/fltrace/xgboost_include
-FLTRACE_LD = g++
 # Use a CPU-only libxgboost.so (vendored under tools/fltrace/xgboost_cpu_lib,
 # extracted from the `xgboost-cpu` PyPI wheel - not pip-installed, since that
 # package shares the `xgboost` import name and would silently replace
@@ -201,6 +213,7 @@ FLTRACE_LD = g++
 XGBOOST_LIB_DIR = $(CURDIR)/tools/fltrace/xgboost_cpu_lib
 XGBOOST_LIBS = -L$(XGBOOST_LIB_DIR) -lxgboost -Wl,-rpath=$(XGBOOST_LIB_DIR)
 XGBOOST_LINK_FLAGS = -Wl,--whole-archive $(XGBOOST_LIBS) -Wl,--no-whole-archive -lstdc++
+endif
 endif
 
 # raw pc/pointer-content tracing for collecting prefetcher training data

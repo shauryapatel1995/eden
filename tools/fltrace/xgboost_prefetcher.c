@@ -24,6 +24,17 @@
 #include "rmem/prefetch.h"
 #include "native_prefetch_predict.h"
 
+/* NATIVE_ONLY (opt-in: make fltrace.so DO_PREFETCH=1 NATIVE_ONLY=1) strips out
+ * every bit of libxgboost usage below at COMPILE time, not just at runtime.
+ * Runtime-only gating (checking EDEN_PREFETCH_NATIVE_MODEL and skipping the
+ * libxgboost calls) still leaves libxgboost.so linked as a DT_NEEDED
+ * dependency, which is enough for the dynamic linker to load it and run its
+ * global C++ destructors (e.g. dmlc::Registry::~Registry()) at process exit
+ * via _dl_fini() - and that destructor path itself can hang, even though we
+ * never called a single xgboost function all run. Only actually not linking
+ * the library avoids this. */
+#ifndef NATIVE_ONLY
+
 // XGBoost C API
 #include <xgboost/c_api.h>
 
@@ -46,9 +57,26 @@ static pthread_mutex_t model_init_lock = PTHREAD_MUTEX_INITIALIZER;
 #define XGBOOST_LIB_PATH_DEFAULT "/usr/local/lib/libxgboost.so"
 #define XGBOOST_MODEL_PATH_ENV "EDEN_PREFETCH_MODEL_PATH"
 #define XGBOOST_MODEL_PATH_DEFAULT "./eden_xgboost_model.json"
+#define NATIVE_MODEL_ENV "EDEN_PREFETCH_NATIVE_MODEL"
+
+/* cached once - checked before doing anything that would touch libxgboost */
+static int native_mode_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        const char *env = getenv(NATIVE_MODEL_ENV);
+        cached = (env && env[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
 
 __attribute__((constructor))
 void xgboost_pre_init(void) {
+    /* native mode never calls into libxgboost at all, so don't even dlopen
+     * it - see native_mode_enabled()'s callers for why this matters (a
+     * starved thread pool from a one-time model load that's never used). */
+    if (native_mode_enabled())
+        return;
+
     // Attempt to open libxgboost.so. RTLD_NOW forces immediate resolution of all
     // symbols, and the act of dlopen() is what triggers the static constructors
     // of libxgboost.so to run.
@@ -285,7 +313,28 @@ void free_model(XGBoostModel* model) {
     }
 }
 
+#endif // NATIVE_ONLY
+
 void init_prefetcher() {
+#ifdef NATIVE_ONLY
+    log_info("prefetch inference mode: native (hand-compiled trees, "
+             "libxgboost not linked into this build)");
+#else
+    /* native mode never touches global_model (page_postfetch_preds routes
+     * straight to native_predict_batch), so skip calling into libxgboost at
+     * all here - XGBoosterLoadModel() internally runs an OpenMP parallel-for
+     * to load tree nodes, which spins up libgomp's thread pool sized to
+     * nproc; those threads then busy-spin at a barrier for the rest of the
+     * process's life instead of blocking, permanently starving the real
+     * mcf/handler threads of CPU on a fully-subscribed core count. Loading
+     * the model was only ever meant as a load-succeeds sanity check, not
+     * something the native path depends on. */
+    if (native_mode_enabled()) {
+        log_info("prefetch inference mode: native (hand-compiled trees, no "
+                 "libxgboost) - skipping libxgboost model load entirely");
+        return;
+    }
+
     const char* model_path = getenv(XGBOOST_MODEL_PATH_ENV);
     if (!model_path)
         model_path = XGBOOST_MODEL_PATH_DEFAULT;
@@ -317,6 +366,7 @@ void init_prefetcher() {
     log_info("prefetcher initialized successfully");
 
     pthread_mutex_unlock(&model_init_lock);
+#endif // NATIVE_ONLY
 }
 
 /*
@@ -337,20 +387,13 @@ unsigned long page_prefetch_preds(FeatureVector features[], int *response_arr) {
  * Features: input features computed at pagefault.
  * Reponse arr: Output predictions.
  */
-#define NATIVE_MODEL_ENV "EDEN_PREFETCH_NATIVE_MODEL"
-
 unsigned long page_postfetch_preds(FeatureVector features[], int *response_arr, int batch_size) {
-    static int native_mode = -1;
-    if (native_mode == -1) {
-        const char *env = getenv(NATIVE_MODEL_ENV);
-        native_mode = (env && env[0] == '1') ? 1 : 0;
-        log_info("prefetch inference mode: %s",
-            native_mode ? "native (hand-compiled trees, no libxgboost)" : "libxgboost");
-    }
-
     /* native path: hand-compiled tree evaluator baked in at build time from
      * native_tree_model.h, no DMatrix/JSON/libxgboost call at all */
-    if (native_mode)
+#ifdef NATIVE_ONLY
+    return native_predict_batch(features, batch_size, response_arr);
+#else
+    if (native_mode_enabled())
         return native_predict_batch(features, batch_size, response_arr);
 
     float probs[batch_size];
@@ -375,6 +418,7 @@ unsigned long page_postfetch_preds(FeatureVector features[], int *response_arr, 
         response_arr[i] = probability_to_prediction(probs[i]);
 
     return 0;
+#endif // NATIVE_ONLY
 }
 
 #endif // DO_PREFETCH
