@@ -24,6 +24,11 @@ const char *rstat_names[] = {
     "prefetched_pages",
     "prefetch_candidates_gated",
     "prefetch_candidates_positive",
+    "prefetch_spatial_candidates_gated",
+    "prefetch_spatial_candidates_positive",
+    "prefetch_spatial_prefetches",
+    "prefetch_backend_busy",
+    "prefetch_skipped_stop_early",
 
     /* eviction stats */
     "evict_ops",
@@ -61,6 +66,10 @@ const char *rstat_names[] = {
 	"prefetch_gate_cycles",
 	"prefetch_infer_cycles",
 	"prefetch_act_cycles",
+	"prefetch_spatial_scan_cycles",
+	"prefetch_spatial_gate_cycles",
+	"prefetch_spatial_infer_cycles",
+	"prefetch_spatial_act_cycles",
 	"handle_fault_cycles",
 
 	/* rmem hints */

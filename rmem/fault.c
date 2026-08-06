@@ -699,6 +699,18 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
                 RSTAT(BACKEND_WAIT_CYCLES) += duration;
             }
 
+#ifdef DO_PREFETCH
+            /* score+dispatch the 4 spatial/next-N candidates now, rather
+             * than waiting for fault_done() after this read completes -
+             * they need no page content, just the faulting address, so
+             * there's no reason to make them wait behind the RTT of the
+             * read they're piggybacking on (in RMEM_STANDALONE builds -
+             * which is all of ours - there's no cross-thread stealing of
+             * this fault before fault_done() runs, so accessing it here is
+             * safe; see page_prefetch_spatial() in prefetch.c) */
+            page_prefetch_spatial(fault, chan_id);
+#endif
+
             status = FAULT_READ_POSTED;
             goto pages_added_out;
         }
