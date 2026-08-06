@@ -40,6 +40,7 @@ struct page_list_per_prio dne_pages;
 int evict_ngens = 1;
 int evict_gen_mask = 0;
 int evict_nprio = 1;
+struct page_list staging_pages;
 unsigned long epoch_start_tsc;
 int epoch_tsc_shift;
 struct sampler epoch_sampler;
@@ -296,7 +297,76 @@ int drain_tmp_lists(struct list_head* evict_list, int max_drain,
     return npages;
 }
 
-/* finds eviction candidates - returns the number of candidates found and 
+/* add a freshly-prefetched page node to the staging area instead of directly
+ * to the real eviction lists - see PREFETCH_STAGING_MAX_PAGES in config.h.
+ * If staging is already at capacity, the oldest staged page ages out into
+ * the real eviction lists to make room (RSTAT_STAGING_AGED_OUT) - it's had
+ * its grace period without being reclaimed, so treat it the same as any
+ * other resident page from here on. */
+void staging_add(struct rmpage_node* pgnode, int prio)
+{
+    struct rmpage_node* aged_out;
+    struct page_list* evict_gen;
+
+    spin_lock(&staging_pages.lock);
+    if (staging_pages.npages >= PREFETCH_STAGING_MAX_PAGES) {
+        aged_out = list_pop(&staging_pages.pages[0], rmpage_node_t, link);
+        assert(aged_out);
+        staging_pages.npages--;
+        spin_unlock(&staging_pages.lock);
+
+        RSTAT(STAGING_AGED_OUT)++;
+        evict_gen = &evict_gens[get_highest_evict_gen()];
+        spin_lock(&evict_gen->lock);
+        list_add_tail(&evict_gen->pages[aged_out->evict_prio], &aged_out->link);
+        evict_gen->npages++;
+        spin_unlock(&evict_gen->lock);
+
+        spin_lock(&staging_pages.lock);
+    }
+    pgnode->staged_at_fault = atomic64_read(&prefetch_fault_counter);
+    list_add_tail(&staging_pages.pages[0], &pgnode->link);
+    staging_pages.npages++;
+    spin_unlock(&staging_pages.lock);
+}
+
+/* drain up to batch_size pages straight out of the staging area into
+ * evict_list, cheapest possible eviction candidates since none of them have
+ * any confirmed use yet. A page is only eligible once it's survived at
+ * least PREFETCH_STAGING_MIN_FAULT_AGE real faults since being staged (see
+ * config.h) - since staging is a strict FIFO, insertion order is also age
+ * order, so the moment the head isn't old enough yet, nothing behind it is
+ * either and we can stop immediately rather than scanning. Returns how many
+ * were added - can legitimately be 0 even with pages present, if none have
+ * aged in yet (eviction then falls through to the real working set for this
+ * call, same as if staging were empty). */
+static inline int drain_staging(struct list_head* evict_list, int batch_size)
+{
+    int npages = 0;
+    struct rmpage_node* page;
+    unsigned long fault_now;
+
+    spin_lock(&staging_pages.lock);
+    fault_now = atomic64_read(&prefetch_fault_counter);
+    while (npages < batch_size) {
+        page = list_top(&staging_pages.pages[0], rmpage_node_t, link);
+        if (!page)
+            break;
+        if (fault_now - page->staged_at_fault < PREFETCH_STAGING_MIN_FAULT_AGE)
+            break;
+        page = list_pop(&staging_pages.pages[0], rmpage_node_t, link);
+        staging_pages.npages--;
+        list_add_tail(evict_list, &page->link);
+        npages++;
+    }
+    spin_unlock(&staging_pages.lock);
+
+    if (npages > 0)
+        RSTAT(STAGING_EVICTED) += npages;
+    return npages;
+}
+
+/* finds eviction candidates - returns the number of candidates found and
  * sends out the list of page nodes */
 static inline int find_candidate_pages(struct list_head* evict_list,
     int batch_size)
@@ -313,6 +383,14 @@ static inline int find_candidate_pages(struct list_head* evict_list,
     gen_id = start_gen = -1;
     npages = npopped = 0;
     bitmap_init(tmplist_used, evict_ngens, 0);
+
+    /* always drain the prefetch staging area first - these are the
+     * cheapest possible candidates (no confirmed use), so a real fault's
+     * eviction demand should never have to touch the real working set while
+     * unconfirmed prefetched pages are still sitting around */
+    npages += drain_staging(evict_list, batch_size);
+
+    if (npages < batch_size)
     do {
 
         /* get current lru gen */
@@ -997,8 +1075,15 @@ int eviction_init(void)
         evict_gens[i].npages = 0;
         spin_lock_init(&evict_gens[i].lock);
     }
-    log_info("inited %s eviction with %d gens. gen mask: %x", 
+    log_info("inited %s eviction with %d gens. gen mask: %x",
         policy, evict_ngens, evict_gen_mask);
+
+    /* init prefetch staging area */
+    list_head_init(&staging_pages.pages[0]);
+    staging_pages.npages = 0;
+    spin_lock_init(&staging_pages.lock);
+    log_info("inited prefetch staging area, max %d pages",
+        PREFETCH_STAGING_MAX_PAGES);
 
 #ifdef EVICTION_DNE_ON
     /* init do-not-evict list */

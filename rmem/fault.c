@@ -182,35 +182,20 @@ bool fault_can_rdahead(pgflags_t rdahead_page, pgflags_t base_page)
     return true;
 }
 
-/* get the eviction list farthest from the current evicting list (based on 
- * policy) to add the faulting page to */
-int __always_inline get_highest_evict_gen(void)
-{
-#ifdef SC_EVICTION
-    assert(evict_ngens == 2 && evict_gen_mask == 1);
-    return (ACCESS_ONCE(evict_gen_now) + 1) & 1;
-#endif
-#ifdef LRU_EVICTION
-    return (ACCESS_ONCE(evict_gen_now) + evict_ngens - 1) & evict_gen_mask;
-#endif
-    return 0;
-}
-
 /* after a prefetched page has been uffd-copied into the address space, we
- * must allocate a new page node to track it and add it to the eviction
- * lists (same as fault_alloc_page_nodes() below, but for a single
- * out-of-band prefetched page rather than the fault's own rdahead range) */
+ * must allocate a new page node to track it and add it to the prefetch
+ * staging area (same as fault_alloc_page_nodes() below, but for a single
+ * out-of-band prefetched page rather than the fault's own rdahead range) -
+ * see staging_add() in eviction.c for why this doesn't go directly into the
+ * real eviction lists like a normal fault-driven page does */
 static inline void prefetch_alloc_page_nodes(unsigned long addr,
     struct region_t* mr, int prio)
 {
     struct rmpage_node* pgnode;
-    struct list_head new;
-    struct page_list* evict_gen;
     pgidx_t pgidx;
 
     assert(prio >= 0 && prio < evict_nprio);
 
-    list_head_init(&new);
     pgnode = rmpage_node_alloc();
     assert(pgnode);
 
@@ -220,7 +205,6 @@ static inline void prefetch_alloc_page_nodes(unsigned long addr,
     pgnode->mr = mr;
     pgnode->addr = addr;
     pgnode->evict_prio = prio;
-    list_add_tail(&new, &pgnode->link);
 
     pgidx = rmpage_get_node_id(pgnode);
     pgidx = set_page_index(pgnode->mr, pgnode->addr, pgidx);
@@ -228,11 +212,7 @@ static inline void prefetch_alloc_page_nodes(unsigned long addr,
 
     /* XXX: prefetched pages don't currently participate in the
      * do-not-evict (DNE) list, unlike fault_alloc_page_nodes() below */
-    evict_gen = &evict_gens[get_highest_evict_gen()];
-    spin_lock(&evict_gen->lock);
-    list_append_list(&evict_gen->pages[prio], &new);
-    evict_gen->npages += 1;
-    spin_unlock(&evict_gen->lock);
+    staging_add(pgnode, prio);
 }
 
 /* after the faulting page (and read-ahead) has been uffd-copied into the
@@ -444,6 +424,10 @@ void fault_done(fault_t* f, int chan_id, int *nevicts_needed)
 #endif
 
 #ifdef DO_PREFETCH
+    /* bump once per real fault serviced, before this fault's own prefetches
+     * (if any) get staged - see prefetch_fault_counter in common.h */
+    atomic64_add_and_fetch(&prefetch_fault_counter, 1);
+
     /* speculatively prefetch pointer-chase candidates off the page we just
      * finished servicing, before releasing its lock. this runs on the
      * single handler thread, which can't poll for the next real uffd

@@ -28,6 +28,13 @@ extern atomic64_t max_memory_used;
 extern atomic64_t memory_allocd;
 extern atomic64_t memory_freed;
 extern bool rmem_inited;
+/* incremented once per real fault serviced, DO_PREFETCH builds only (see
+ * fault_done() in fault.c) - used to stamp/age prefetch-staged pages (see
+ * PREFETCH_STAGING_MIN_FAULT_AGE in config.h and staging_add()/
+ * drain_staging() in eviction.c). Declared unconditionally since eviction.c
+ * (which is always compiled) reads it; only the increment site is
+ * DO_PREFETCH-gated. */
+extern atomic64_t prefetch_fault_counter;
 
 /* thread-local */
 extern __thread pgthread_t current_kthread_id;

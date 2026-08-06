@@ -94,6 +94,7 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
      * candidates we could actually prefetch, instead of wasting cycles on
      * ones we already know we'll skip.
      */
+    unsigned long pass_start_tsc = rdtsc();
     for (int i = 0; i < 512; i++) {
         assert(f);
         uint64_t ptr_val = *((uint64_t *) f->page + i);
@@ -113,18 +114,21 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
             ncandidates++;
         }
     }
+    RSTAT(PREFETCH_GATE_CYCLES) += rdtsc() - pass_start_tsc;
 
     /*
      * Pass 2: one batched inference call for every locked candidate,
      * instead of up to ncandidates individual predict calls each paying
      * its own per-call overhead.
      */
+    pass_start_tsc = rdtsc();
     RSTAT(PREFETCH_CANDIDATES_GATED) += ncandidates;
     if (ncandidates > 0)
         page_postfetch_preds(compact_features, compact_responses, ncandidates);
     for (int k = 0; k < ncandidates; k++)
         if (compact_responses[k] == 1)
             RSTAT(PREFETCH_CANDIDATES_POSITIVE)++;
+    RSTAT(PREFETCH_INFER_CYCLES) += rdtsc() - pass_start_tsc;
 
     /*
      * Pass 3: act on results. Every candidate here is already locked, so
@@ -133,6 +137,7 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
      * candidates hadn't been locked yet) - remaining locked candidates
      * must still have their lock released or they'd leak.
      */
+    pass_start_tsc = rdtsc();
     stop_early = false;
     for (int k = 0; k < ncandidates; k++) {
         uint64_t ptr_val = compact_ptr_val[k];
@@ -165,6 +170,7 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
             clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
         }
     }
+    RSTAT(PREFETCH_ACT_CYCLES) += rdtsc() - pass_start_tsc;
 
     /*
      * book memory pressure for the prefetch reads we just posted (mirrors

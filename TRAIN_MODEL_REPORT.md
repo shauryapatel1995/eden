@@ -104,6 +104,42 @@ Two architectural fixes, complementary, both real implementation work (not somet
 1. **A staging/quarantine area for prefetched-but-unreferenced pages.** Keep prefetched pages in a small separate list; evict from it preferentially (cheap to discard a wrong guess) and only promote a page into the main resident set once it's actually touched. This decouples "cost of a wrong guess" from "damage to the real working set."
 2. **Enable the already-implemented LRU eviction policy.** `rmem/eviction.c` has a working LRU policy gated by `#define LRU_EVICTION` in `inc/rmem/config.h:120` (currently commented out, so all of tonight's runs used the recency-blind default policy instead). It needs `evict_ngens > 1` to be meaningful (currently defaults to 1 with no runtime env var found to raise it — would need a small addition), and is mutually exclusive with `SC_EVICTION` (second-chance). LRU alone doesn't stop a wrong prefetch from evicting something hot (a freshly-prefetched page looks "recent" too, regardless of whether it's ever used) — it addresses a related but distinct problem (recency-blind eviction hurting *all* insertions, prefetch-driven or not). Doing both together would likely help most.
 
+## 9. Prefetch staging area — built, validated, then partially reverted
+
+Built a staging/quarantine mechanism (fix #1 from section 8): prefetched pages land in a separate FIFO list (`staging_pages` in `rmem/eviction.c`) instead of the main eviction lists. Two design iterations were tried:
+
+**v1 (2048 pages / 8MB capacity, drains on every normal eviction):** `find_candidate_pages()` always tries to satisfy an eviction batch from staging first; `staging_add()` ages the oldest staged page into the main pool if staging is already full when a new prefetch arrives. **This worked extremely well** — local and RDMA results with the F0.5 model came back statistically indistinguishable from the no-prefetch baseline on faults/net_reads/evictions, while wall clock only regressed by ~13-22% (down from +82-155% before staging):
+
+| Metric | No-prefetch | F0.5, no staging | F0.5, **staging v1** |
+|---|---|---|---|
+| Local wall clock | 1m31.651s | 2m57.220s | **1m52.196s** |
+| Local faults_done | 3,460,551 | 5,199,371 | **3,460,542** |
+| Local net_reads | 2,051,664 | 3,604,422 | **2,040,750** (better than baseline) |
+| RDMA wall clock | 1m56.503s | 3m32.425s | **2m11.698s** |
+| RDMA faults_done | 3,468,854 | 5,202,737 | **3,470,724** |
+
+Also measured average end-to-end prefetcher latency per real fault (`prefetch_scan_cycles / faults_done`, this machine's ~2893 ticks/µs): **~9.7µs/fault** (RDMA F0.5 run) — this is candidate-scan + gating + batched native-tree inference combined, not the same as the ~0.3µs isolated tree-evaluation number measured earlier. This ~9.7µs/fault is the likely remaining source of the residual wall-clock gap, since it's paid on every real fault regardless of prefetch outcome.
+
+**v2 (64MB/16384 pages, only ages out when staging itself is full, never drained by normal eviction):** this was a regression, worse than even the no-staging baseline:
+
+| Metric | No-prefetch | Staging v1 (8MB, drain-first) | Staging v2 (64MB, age-out-only) |
+|---|---|---|---|
+| Wall clock | 1m31.651s | 1m52.196s | **3m58.197s** |
+| faults_done | 3,460,551 | 3,460,542 | **6,813,486** |
+| evict_pages_popped | 2,143,872 | 2,135,623 | **5,522,037** |
+
+Root cause: making staged pages fully immune to normal eviction pressure, plus reserving 64MB (23% of the 273MB total budget) that can't be reclaimed early even for obviously-wrong prefetches, starves the main pool's *own* usable budget (down to 209MB) and forces it to thrash harder to stay under the ceiling on its own. **Currently reverted back to v1's design** (drain-first, 2048 pages) in the source tree.
+
+## 10. TODO — revisit: real accessed-bit tracking via a kernel syscall (not attempted tonight)
+
+Investigated whether userspace/a kernel module can read the hardware PTE accessed bit as a "was this staged page touched" signal, to give staged pages a genuine second chance instead of a pure zero-signal FIFO. Findings, in order:
+
+1. `/sys/kernel/mm/page_idle/bitmap` (`page_idle`) technically works for a *single* mark→touch→check cycle, but fails on *repeated* cycles on the same page: its clear path (`ptep_test_and_clear_young`) doesn't flush the TLB, so a cached TLB entry lets later touches skip the page-table walk that would re-set the bit. Confirmed at the source level, 20/20 empirical trials.
+2. Tried writing a custom out-of-tree kernel module to do the read+clear+flush correctly ourselves (using `follow_pte()`, `pte_young()`/`pte_mkold()`, `set_pte_at()` — all fine for modules). Hit a hard wall: `arch/x86/include/asm/tlbflush.h` wraps `flush_tlb_page()`/`flush_tlb_mm_range()`/everything else needed to invalidate a TLB entry in `#ifndef MODULE ... #endif` (confirmed by inspecting the preprocessed output of the actual kbuild invocation) — the kernel deliberately excludes these from module visibility, not just missing an export. Escaping it means hand-rolling TLB shootdown IPI logic from lower-level exported primitives (`smp_call_function_many()` + `mm_cpumask()` + raw `invlpg`) — real, working-in-principle, but a genuinely risky low-level hack (get it wrong and the failure mode is memory corruption, not just a wrong reading).
+3. User pointed to a similar project, [ExtMem](https://github.com/shauryapatel1995/ExtMem) (`src/policies/disklinux.c:359`, `pt_get_bits()`/`pt_clear_accessed_flag()`), which does exactly this successfully. Traced it to a `linux` git submodule pointing at a **custom-patched kernel fork** (`github.com/SepehrDV2/linux`, based on 5.15, credited to the **hemem** far-memory system for its "kernel patches for userfaultfd interface"). Code running inside the kernel proper (via a real patch/syscall) has no `#ifndef MODULE` restriction, so it *can* correctly flush — notably, ExtMem's own code still comments out the flush call (`//extmem_tlb_shootdown(page->va); // this will improve accuracy but degrade performance`), making the same speed/accuracy tradeoff we've been discussing, just with the *option* available to them that isn't available to us as a plain module.
+
+**Conclusion: real, low-staleness accessed-bit tracking is achievable, but requires patching Eden's own kernel** (already a custom build at `/home/shaurya/linux`, 5.16.0+) with a small new syscall exposing read+clear+flush of the accessed bit for a given (pid, vaddr) — not an out-of-tree module. Cost: kernel patch + rebuild + reinstall + **reboot the machine** (interrupts everything currently running, RDMA connections included). Deliberately not done tonight given that operational cost. **Revisit this** as a scoped follow-up if the staging area's zero-signal design proves to be a real ceiling on further improvement.
+
 ## Artifacts
 
 - Cleaned dataset: `/data1/shaurya/deku_mcf/mcf-train-trace-clean.parquet`
@@ -113,4 +149,6 @@ Two architectural fixes, complementary, both real implementation work (not somet
 - Prefetch-enabled native-only builds: `/home/shaurya/eden/fltrace_prefetch_{f1,f05}_native.so` (local), `/home/shaurya/eden/fltrace_rdma_prefetch_{f1,f05}_native.so` (RDMA)
 - No-prefetch build used for baseline: `/home/shaurya/eden/fltrace_noprefetch.so`
 - Run logs: `/data1/shaurya/deku_mcf/mcf_train_{local,rdma}_prefetch_{f1,f05}.log`, `/data1/shaurya/deku_mcf/mcf_train_local_np.log`, `/data1/shaurya/deku_mcf/mcf_train_rdma_np.log`
-- Code changes (not yet committed): `tools/fltrace/xgboost_prefetcher.c` (native-mode libxgboost skip fixes), `Makefile` (`NATIVE_ONLY=1` build flag)
+- Code changes (not yet committed): `tools/fltrace/xgboost_prefetcher.c` (native-mode libxgboost skip fixes), `Makefile` (`NATIVE_ONLY=1` build flag), `rmem/eviction.c`/`inc/rmem/eviction.h`/`rmem/fault.c` (prefetch staging area), `inc/rmem/config.h` (`PREFETCH_STAGING_MAX_PAGES`), `inc/rmem/stats.h`/`rmem/stats.c` (`staging_aged_out` counter)
+- Staging-enabled builds: `/home/shaurya/eden/fltrace_prefetch_f05_staging.so` (local, v1 8MB design), `/home/shaurya/eden/fltrace_rdma_prefetch_f05_staging.so` (RDMA, v1), `/home/shaurya/eden/fltrace_prefetch_f05_staging64mb.so` (local, v2 64MB design - reverted, kept only for reference)
+- Kernel module scratch work (accessed-bit investigation, not integrated): `/tmp/claude-1005/-home-shaurya-eden/dfb21282-c741-4693-addb-3df11ff6cb4a/scratchpad/acctest/` (out-of-tree module proving the TLB-flush restriction; not useful as-is since it can't flush)

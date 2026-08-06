@@ -22,13 +22,24 @@ struct rmpage_node {
     struct list_node link;
     uint8_t evict_prio;
 
-    /* time epoch when page was last accessed. this is set by hints and consumed 
-     * by the eviction routines to make smarter eviction choices. we treat it 
+    /* time epoch when page was last accessed. this is set by hints and consumed
+     * by the eviction routines to make smarter eviction choices. we treat it
      * merely as a performance hint that can be inaccurate to avoid the overhead
-     * of locking the page node or ensuring the node is valid. that means, in 
-     * rare cases, this field can be set when the page node does not exist for 
+     * of locking the page node or ensuring the node is valid. that means, in
+     * rare cases, this field can be set when the page node does not exist for
      * a page or is associated with a different page. */
     unsigned long epoch;
+
+    /* prefetch_fault_counter's value at the moment this page was staged -
+     * see PREFETCH_STAGING_MIN_FAULT_AGE in config.h. Only meaningful while
+     * the node is on staging_pages; irrelevant once promoted/evicted.
+     * Unconditionally present (not #ifdef DO_PREFETCH) because staging_add()/
+     * drain_staging() in eviction.c are themselves unconditionally compiled -
+     * their only caller (prefetch_alloc_page_nodes() in fault.c) lives in
+     * shared code, so gating this field would leave it referenced-but-absent
+     * in non-DO_PREFETCH builds, the same class of bug fixed for
+     * get_highest_evict_gen()/staging_add() earlier. */
+    unsigned long staged_at_fault;
 };
 typedef struct rmpage_node rmpage_node_t;
 BUILD_ASSERT(EVICTION_MAX_PRIO <= UINT8_MAX);   /* due to evict_prio */

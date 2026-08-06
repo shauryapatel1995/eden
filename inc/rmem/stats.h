@@ -47,6 +47,14 @@ enum {
     RSTAT_EVICT_MADV,
     RSTAT_EVICT_DONE,
     RSTAT_EVICT_PAGES_DONE,
+    RSTAT_STAGING_EVICTED,     /* pages evicted straight out of the prefetch
+                                 * staging area (the intended, cheap case) */
+    RSTAT_STAGING_AGED_OUT,    /* pages that outlived staging's capacity and
+                                 * got promoted into the real eviction lists
+                                 * without ever being evicted from staging -
+                                 * rare in practice since normal eviction
+                                 * pressure keeps staging well under
+                                 * capacity most of the time */
 
     /* network read/writes */
     RSTAT_NET_READ,
@@ -81,6 +89,14 @@ enum {
                                   * the clock once the handler reads the
                                   * uffd event, not when the fault truly
                                   * occurred) */
+    RSTAT_PREFETCH_GATE_CYCLES,  /* subset of PREFETCH_SCAN_CYCLES: just the
+                                   * is_page_prefetchable() gating loop over
+                                   * up to 516 candidates (pass 1) */
+    RSTAT_PREFETCH_INFER_CYCLES, /* subset of PREFETCH_SCAN_CYCLES: just the
+                                   * batched model inference call (pass 2) */
+    RSTAT_PREFETCH_ACT_CYCLES,   /* subset of PREFETCH_SCAN_CYCLES: just
+                                   * posting reads for positive predictions
+                                   * (pass 3) */
     RSTAT_HANDLE_FAULT_CYCLES,  /* total handler-thread time spent inside
                                   * handle_page_fault() across every call
                                   * (fresh faults and wait-queue re-checks

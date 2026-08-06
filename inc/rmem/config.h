@@ -115,6 +115,26 @@ BUILD_ASSERT(CHUNK_SIZE >= PGSIZE_4KB);
 #define OS_MEM_PROBE_INTERVAL       1e6
 BUILD_ASSERT(EVICTION_MAX_BATCH_SIZE <= RMEM_MAX_CHUNKS_PER_OP);
 
+/* prefetch staging area (opt-in via DO_PREFETCH): pages brought in by a
+ * prefetch (as opposed to a real fault) land here first instead of directly
+ * in the normal eviction lists, so a wrong prefetch's cost stays contained
+ * here instead of triggering a batch eviction that indiscriminately sweeps
+ * out hot pages (see TRAIN_MODEL_REPORT.md for the measured amplification
+ * this caused, and section 9 for why the larger/age-out-only variant tried
+ * afterward was a regression - reserving a big chunk of the budget
+ * permanently for staging starves the main pool more than it helps). No
+ * access-tracking/promotion signal (would need real hardware accessed-bit
+ * tracking, deferred - see report section 10) - instead, a page must have
+ * survived at least this many real faults since being staged before
+ * eviction can touch it (measured from the mcf `train` trace: the median
+ * genuine cache hit happens within 4 real faults, 90th percentile within
+ * 253 - 250 covers most of that without protecting pages indefinitely).
+ * Eviction still ages the oldest staged page out once the area itself is
+ * completely full, as a backstop against unbounded growth if insertions
+ * outpace both natural draining and this age threshold. */
+#define PREFETCH_STAGING_MAX_PAGES     2048
+#define PREFETCH_STAGING_MIN_FAULT_AGE 250
+
 /* eviction policy (default is none) */
 // #define SC_EVICTION     /* second-chance eviction */
 // #define LRU_EVICTION    /* LRU eviction */

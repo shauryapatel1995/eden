@@ -35,6 +35,8 @@ const char *rstat_names[] = {
     "evict_madv",
     "evict_ops_done",
     "evict_pages_done",
+    "staging_evicted",
+    "staging_aged_out",
 
     /* network read/writes */
     "net_reads",
@@ -56,6 +58,9 @@ const char *rstat_names[] = {
 	"backend_wait_cycles",
 	"app_fault_wait_cycles",
 	"prefetch_scan_cycles",
+	"prefetch_gate_cycles",
+	"prefetch_infer_cycles",
+	"prefetch_act_cycles",
 	"handle_fault_cycles",
 
 	/* rmem hints */
