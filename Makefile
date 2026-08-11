@@ -224,6 +224,15 @@ ifneq ($(DO_TRACING),)
 CFLAGS += -DDO_TRACING
 endif
 
+# direct wall-clock measurement of handle_page_fault() via clock_gettime()
+# (opt-in: make fltrace.so DO_FAULT_TIMING=1). Prints one line per call in
+# microseconds for the first FAULT_TIMING_LIMIT calls, for reading raw
+# per-fault numbers directly instead of inferring from rdtsc()/assumed
+# cycles-per-us - see rmem/handler.c.
+ifneq ($(DO_FAULT_TIMING),)
+CFLAGS += -DDO_FAULT_TIMING
+endif
+
 # RDMA backend support (opt-in: make fltrace.so RDMA=1). Needed to select
 # FLTRACE_RMEM_BACKEND=rdma at runtime instead of the default local backend.
 # Kept out of the default build: linking -lrdmacm/-libverbs pulls in
