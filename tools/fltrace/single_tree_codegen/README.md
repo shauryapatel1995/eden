@@ -51,6 +51,13 @@ Writes `native_tree_model_spatial.h` and `native_tree_model_pointer.h` into
 `tools/fltrace/` (one level up - alongside the `.c` files that include them)
 by default. Pass `--out_dir` to write somewhere else.
 
+`--max_depth N` (default `4`) and `--max_num_nodes N` (default `10`) are
+passed straight through to `STreeDClassifier` and bound how large each
+per-PC tree is allowed to grow. Smaller trees are cheaper to walk per
+candidate at runtime and less prone to overfitting a PC's local sample; the
+defaults are tuned for that per-candidate walk cost, so raise them only if
+per-PC accuracy is the bottleneck.
+
 **Regenerate these two headers whenever the training dataset changes** - they're
 committed (like the old ensemble headers were) since `single_tree_predict_*.c`
 bakes the model in at compile time; there's no runtime model-loading path.
