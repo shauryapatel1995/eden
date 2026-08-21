@@ -10,7 +10,7 @@ outside this repo.
 
 Usage:
     python gen_single_tree_code.py <dataset.csv> [--top_n N | --min_support N]
-        [--max_depth N] [--max_num_nodes N] [--out_dir DIR]
+        [--max_depth N] [--max_num_nodes N] [--f_beta B] [--out_dir DIR]
 """
 import argparse
 import os
@@ -24,9 +24,9 @@ from main import main as train_models  # noqa: E402
 from pystreed_to_c import convert_models_to_c_code  # noqa: E402
 
 
-def generate(filename: str, top_n: int, min_support: int, max_depth: int, max_num_nodes: int, out_dir: str) -> None:
+def generate(filename: str, top_n: int, min_support: int, max_depth: int, max_num_nodes: int, out_dir: str, f_beta: float = 1.0) -> None:
     pc_to_model_map, pc_to_normalization_cache_map = train_models(
-        filename, top_n, min_support, max_depth, max_num_nodes)
+        filename, top_n, min_support, max_depth, max_num_nodes, f_beta)
 
     os.makedirs(out_dir, exist_ok=True)
     for category in ("spatial", "pointer"):
@@ -54,6 +54,8 @@ if __name__ == "__main__":
     parser.add_argument("--out_dir", type=str, default=_DEFAULT_OUT_DIR,
                          help="Directory to write native_tree_model_{spatial,pointer}.h into "
                               "(default: tools/fltrace/, alongside single_tree_predict_*.c)")
+    parser.add_argument("--f_beta", type=float, default=1.0,
+                        help="Beta for F-beta score (0.5 = precision-weighted, 1.0 = F1, 2.0 = recall-weighted)")
     args = parser.parse_args()
 
-    generate(args.filename, args.top_n, args.min_support, args.max_depth, args.max_num_nodes, args.out_dir)
+    generate(args.filename, args.top_n, args.min_support, args.max_depth, args.max_num_nodes, args.out_dir, args.f_beta)

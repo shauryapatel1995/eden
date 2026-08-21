@@ -40,50 +40,16 @@ gen_single_tree_code.py  -- driver: ties the above together, writes
                                                  native_eval_tree() walks it
 ```
 
-## Usage
+## Quick start
+
+See [USAGE.md](USAGE.md) for full usage, CLI options (including `--f_beta`
+for precision/recall tuning), build instructions for the modified PySTreeD,
+and CSV format details.
 
 ```sh
+uv pip install -e pystreed_src/        # build modified PySTreeD (once, or after C++ changes)
 python gen_single_tree_code.py <dataset.csv> --min_support 100
-# or: --top_n N  to just take the N most frequent PCs instead
 ```
-
-Writes `native_tree_model_spatial.h` and `native_tree_model_pointer.h` into
-`tools/fltrace/` (one level up - alongside the `.c` files that include them)
-by default. Pass `--out_dir` to write somewhere else.
-
-`--max_depth N` (default `4`) and `--max_num_nodes N` (default `10`) are
-passed straight through to `STreeDClassifier` and bound how large each
-per-PC tree is allowed to grow. Smaller trees are cheaper to walk per
-candidate at runtime and less prone to overfitting a PC's local sample; the
-defaults are tuned for that per-candidate walk cost, so raise them only if
-per-PC accuracy is the bottleneck.
-
-**Regenerate these two headers whenever the training dataset changes** - they're
-committed (like the old ensemble headers were) since `single_tree_predict_*.c`
-bakes the model in at compile time; there's no runtime model-loading path.
-
-### Expected CSV columns
-
-`PC, Offset, Delta, Offset_from_faulting, Prev_PC, Prev_delta, Type, Color`
-
-- `Type`: `0` for spatial/next-N candidates, `1` for pointer-chase candidates
-  - trained as two independent models because miss:hit class balance differs
-    drastically between the two (~6:1 vs ~1400:1 on the mcf training set) -
-    one shared model tuned for one ratio predicts positive on ~none of the
-    other's candidates
-- `Color`: `green` = worth prefetching (label 1), anything else = label 0
-- `PC` / `Prev_PC`: hex string or int; `Delta` / `Prev_delta`: raw byte deltas
-  (divided by 4096 during preprocessing to match the page-count units
-  `FeatureVector.delta`/`prev_delta` arrive in at runtime - see the comment
-  in `single_tree_predict_pointer.c`)
-
-### Filtering which PCs get a tree
-
-`--min_support N` keeps every PC with at least N "green" (positive) samples;
-`--top_n N` instead just keeps the N most frequent PCs regardless of label
-balance. Use exactly one. A PC that isn't kept gets no tree - at runtime,
-`get_native_nodes()` returns `NULL` for it and the candidate is treated as
-"not prefetchable" without ever walking a tree.
 
 ## How the C side consumes this
 
@@ -138,11 +104,4 @@ native accuracy doesn't match its Python accuracy.
 
 ## Testing
 
-```sh
-python test_c_parity.py
-```
-
-Trains real models on a small synthetic dataset (through this same
-pipeline), generates C, compiles it against the real `../native_tree_eval.h`,
-and diffs every prediction against `model.predict()` in Python. This is what
-would have caught both bugs described above.
+See [USAGE.md](USAGE.md#testing).

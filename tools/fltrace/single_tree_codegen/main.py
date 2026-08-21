@@ -11,15 +11,17 @@ Args:
     top_n: Number of top PCs to filter by occurrence
     max_depth: Maximum depth of the STreeDClassifier tree
     max_num_nodes: Maximum number of nodes in the STreeDClassifier tree
+    f_beta: Beta parameter for F-beta score optimization (default 1.0 = F1)
 """
 import argparse
 from pystreed import STreeDClassifier
 from preprocessing import load_and_filter_data
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, fbeta_score
+import numpy as np
 
 
-def main(filename: str, top_n: int, min_support: int, max_depth: int, max_num_nodes: int):
+def main(filename: str, top_n: int, min_support: int, max_depth: int, max_num_nodes: int, f_beta: float = 1.0):
     # Load and filter data
     spatial_datasets, pointer_datasets = load_and_filter_data(filename, top_n, min_support)
     pc_datasets = [(dataset, 'spatial') for dataset in spatial_datasets] + \
@@ -38,14 +40,13 @@ def main(filename: str, top_n: int, min_support: int, max_depth: int, max_num_no
 
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        # Train STreeDClassifier model
-        model = STreeDClassifier("f1-score", max_depth=max_depth, max_num_nodes=max_num_nodes)
+        model = STreeDClassifier("f1-score", max_depth=max_depth, max_num_nodes=max_num_nodes, f_beta=f_beta)
         model.fit(X_train, y_train)
-        print(f"Trained model for PC {pc}")
+        print(f"Trained model for PC {pc} (f_beta={f_beta})")
 
-        # Evaluate model on test set
         y_pred = model.predict(X_test)
         print(classification_report(y_test, y_pred))
+        print(f"F{f_beta}-score: {fbeta_score(y_test, y_pred, beta=f_beta):.4f}")
 
         if ds_type == 'spatial':
             pc_to_model_spatial[pc] = model
@@ -77,6 +78,8 @@ if __name__ == "__main__":
     parser.add_argument("--min_support", type=int, default=0, help="Minimum support for filtering PCs")
     parser.add_argument("--max_depth", type=int, default=4, help="Maximum depth of the STreeDClassifier tree")
     parser.add_argument("--max_num_nodes", type=int, default=10, help="Maximum number of nodes in the STreeDClassifier tree")
+    parser.add_argument("--f_beta", type=float, default=1.0,
+                        help="Beta for F-beta score (0.5 = precision-weighted, 1.0 = F1, 2.0 = recall-weighted)")
     args = parser.parse_args()
 
-    main(args.filename, args.top_n, args.min_support, args.max_depth, args.max_num_nodes)
+    main(args.filename, args.top_n, args.min_support, args.max_depth, args.max_num_nodes, args.f_beta)
