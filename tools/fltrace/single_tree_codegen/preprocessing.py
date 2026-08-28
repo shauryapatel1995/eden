@@ -4,8 +4,16 @@ import pandas as pd
 
 
 # Configuration constants
-SPATIAL_COLS = ['Prev_PC', 'Delta', 'Prev_delta']
-POINTER_COLS = ['Delta', 'Offset', 'Offset_from_faulting']
+# Same 6-feature set the ensemble pipeline uses for both categories
+# (gen_tree_code.py's FEATURE_INDEX) - PC is included for parity even
+# though it's constant within any single PC's per-PC dataset here (the
+# whole premise of one tree per PC) and so can never actually be split on;
+# pystreed's binarizer safely no-ops a zero-variance column (see
+# Binarizer.fit() in pystreed/binarizer.py: n_categories<=1 excludes it
+# from ever producing a threshold candidate) rather than erroring, so
+# including it costs nothing beyond a no-op column.
+SPATIAL_COLS = ['PC', 'Offset', 'Delta', 'Offset_from_faulting', 'Prev_PC', 'Prev_delta']
+POINTER_COLS = ['PC', 'Offset', 'Delta', 'Offset_from_faulting', 'Prev_PC', 'Prev_delta']
 OUTPUT_COL = 'Color'
 
 
@@ -73,6 +81,18 @@ def process_pc_data(pc_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, dic
     feature_normalization_cache = {}
     feature_normalization_cache['Prev_PC'] = (mean, std)
 
+    # Same treatment for PC - constant within this function's single-PC
+    # input (mean == the one value, std == 0), so normalize_big_numbers'
+    # std==0 guard makes every row 0.0 here. Genuinely inert as a split
+    # candidate (see SPATIAL_COLS/POINTER_COLS comment above) but still
+    # needs numeric conversion since pystreed can't fit on a raw hex string
+    # column.
+    pcs = [hex_to_int(pc) for pc in data['PC']]
+    pcs_normalized, pc_mean, pc_std = normalize_big_numbers(pcs)
+    data['PC'] = pcs_normalized
+    data['PC'] = data['PC'].astype('float64')
+    feature_normalization_cache['PC'] = (pc_mean, pc_std)
+
     if data['Type'].iloc[0] == 0:
         INPUT_COLS = SPATIAL_COLS
     else:
@@ -105,23 +125,32 @@ def load_and_filter_data(filename: str, top_n: int = 0, min_support: int = 0) ->
     data = pd.read_csv(filename)
     data[OUTPUT_COL] = (data[OUTPUT_COL] == 'green').astype(int)
 
-    # Filter PCs by count threshold
-    pc_counts_total = data['PC'].value_counts().sort_values(ascending=False)
-    if min_support > 0:
-        # filter PCs with at least min_support "Green" occurrences
-        pc_green_counts = data[data[OUTPUT_COL] == 1]['PC'].value_counts()
-        pc_counts = pc_green_counts[pc_green_counts >= min_support].sort_values(ascending=False)
-    elif top_n > 0:
-        pc_counts = pc_counts_total[:top_n]
-    else:
-        raise ValueError("Either top_n or min_support must be greater than 0.")
-
     spatial_data = data[data['Type'] == 0]
     pointer_data = data[data['Type'] == 1]
 
+    def filter_pcs(subset_data):
+        # Filter PCs by count threshold - computed within this category only
+        # (spatial and pointer counted separately), matching the ensemble
+        # pipeline's per-Type keep_pcs convention (gen_tree_code.py). A PC's
+        # combined spatial+pointer hit count can clear min_support even when
+        # neither category alone has enough real signal to trust on its own
+        # (e.g. 60 spatial + 60 pointer hits passing a combined >=100 bar)
+        # - per-category filtering avoids training/deploying a tree on that
+        # kind of thin, category-specific sample.
+        if min_support > 0:
+            green_counts = subset_data.loc[subset_data[OUTPUT_COL] == 1, 'PC'].value_counts()
+            return green_counts[green_counts >= min_support].sort_values(ascending=False)
+        elif top_n > 0:
+            return subset_data['PC'].value_counts().sort_values(ascending=False)[:top_n]
+        else:
+            raise ValueError("Either top_n or min_support must be greater than 0.")
+
+    spatial_pc_counts = filter_pcs(spatial_data)
+    pointer_pc_counts = filter_pcs(pointer_data)
+
     spatial_datasets = []
     # Create separate datasets for each PC
-    for pc in pc_counts.index:
+    for pc in spatial_pc_counts.index:
         pc_data = spatial_data[spatial_data['PC'] == pc]
         if pc_data.empty:
             continue
@@ -136,7 +165,7 @@ def load_and_filter_data(filename: str, top_n: int = 0, min_support: int = 0) ->
         spatial_datasets.append(data_object)
 
     pointer_datasets = []
-    for pc in pc_counts.index:
+    for pc in pointer_pc_counts.index:
         pc_data = pointer_data[pointer_data['PC'] == pc]
         if pc_data.empty:
             continue

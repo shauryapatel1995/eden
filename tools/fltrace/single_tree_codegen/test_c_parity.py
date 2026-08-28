@@ -1,11 +1,14 @@
 """Parity test: STreeD tree predictions in Python must match the generated C.
 
 Builds a small synthetic labeled dataset, trains per-PC models through the
-real pipeline (main.load_and_filter_data via main.main(), preprocessing.py),
-converts them to C with pystreed_to_c.convert_models_to_c_code(), compiles
-that C against the real ../native_tree_eval.h (tools/fltrace/native_tree_eval.h),
-and checks that native_eval_tree()'s output in C matches model.predict() in
-Python for every row.
+real pipeline (main.main(), which fits+converts each PC inside its own
+subprocess - see main.py's module docstring for why), and checks that
+native_eval_tree()'s output in C matches the model's own predictions in
+Python for every row. The fitted model objects never leave their
+subprocess (unpicklable C++ internals), so "Python's predictions" here are
+whatever main.py's workers computed and handed back as plain data
+(feat_rows/y_pred) at training time, not a fresh model.predict() call made
+by this test.
 
 Run directly: `python test_c_parity.py`
 """
@@ -20,8 +23,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from main import main as train_models
-from preprocessing import load_and_filter_data
-from pystreed_to_c import convert_models_to_c_code, fmt_float, FEATURE_INDEX
+from pystreed_to_c import assemble_header_from_c_fragments, fmt_float, FEATURE_INDEX
 
 # tools/fltrace/ - one level up from tools/fltrace/single_tree_codegen/ -
 # where native_tree_eval.h (the shared tree-walk header production code and
@@ -74,24 +76,6 @@ def _make_synthetic_dataset(rng: random.Random) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _build_feat_rows(X: pd.DataFrame, norm_cache: dict) -> list:
-    """Reconstruct the *raw* 6-wide feature vectors native_eval_tree expects
-    from the (partially normalized) X the model was trained/predicted on."""
-    mean, std = norm_cache.get("Prev_PC", (0.0, 1.0))
-    feat_rows = []
-    for _, row in X.iterrows():
-        feat = [0.0] * len(FEATURE_INDEX)
-        for col, idx in FEATURE_INDEX.items():
-            if col not in X.columns:
-                continue
-            v = row[col]
-            if col == "Prev_PC":
-                v = v * std + mean  # invert the z-score normalization
-            feat[idx] = float(v)
-        feat_rows.append(feat)
-    return feat_rows
-
-
 def _generate_test_c(category: str, header_code: str, test_rows: list) -> str:
     lines = []
     lines.append('#include <stdint.h>')
@@ -127,31 +111,26 @@ def run_parity_check() -> bool:
     csv_path = os.path.join(tmp_dir, "synthetic.csv")
     _make_synthetic_dataset(rng).to_csv(csv_path, index=False)
 
-    pc_to_model_map, pc_to_norm_cache_map = train_models(
-        csv_path, top_n=len(SPATIAL_PCS) + len(POINTER_PCS), min_support=0)
-    spatial_datasets, pointer_datasets = load_and_filter_data(
-        csv_path, top_n=len(SPATIAL_PCS) + len(POINTER_PCS), min_support=0)
-    datasets_by_category = {"spatial": spatial_datasets, "pointer": pointer_datasets}
+    # {'spatial': {pc: (c_code, num_nodes, feat_rows, y_pred)}, 'pointer': {...}}
+    # - each PC's fit()+convert already happened inside its own subprocess
+    # (see main.py); feat_rows/y_pred are that same subprocess's own
+    # held-out predictions, handed back as plain data since the model
+    # object itself can't cross the process boundary.
+    pc_code_map = train_models(csv_path, top_n=len(SPATIAL_PCS) + len(POINTER_PCS), min_support=0)
 
     all_ok = True
     for category in ("spatial", "pointer"):
-        models = pc_to_model_map.get(category, {})
-        if not models:
+        entries = pc_code_map.get(category, {})
+        if not entries:
             print(f"[{category}] no models trained, skipping")
             continue
 
-        header_code = convert_models_to_c_code({category: models}, pc_to_norm_cache_map)
+        assemble_entries = {pc: (c_code, num_nodes) for pc, (c_code, num_nodes, _, _) in entries.items()}
+        header_code = assemble_header_from_c_fragments(assemble_entries, category)
 
         test_rows = []       # [(pc_int, feat), ...]
         expected = []        # [0/1, ...] aligned with test_rows
-        for data_object in datasets_by_category[category]:
-            pc = data_object["pc"]
-            X = data_object["X"]
-            norm_cache = data_object["feature_normalization_cache"]
-            model = models[pc]
-
-            y_pred = model.predict(X)
-            feat_rows = _build_feat_rows(X, norm_cache)
+        for pc, (_c_code, _num_nodes, feat_rows, y_pred) in entries.items():
             pc_int = int(pc)
             for feat, pred in zip(feat_rows, y_pred):
                 test_rows.append((pc_int, feat))
@@ -193,7 +172,7 @@ def run_parity_check() -> bool:
             all_ok = False
         else:
             print(f"[{category}] OK - {len(expected)}/{len(expected)} predictions match "
-                  f"across {len(models)} PC(s)")
+                  f"across {len(entries)} PC(s)")
 
     return all_ok
 

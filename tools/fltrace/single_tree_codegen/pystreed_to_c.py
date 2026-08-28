@@ -81,6 +81,32 @@ def convert_tree_to_c_code(pc: int, tree: STreeDClassifier, feature_normalizatio
     return c_code
 
 
+def denormalize_feat_rows(X, feature_normalization_cache: dict) -> list:
+    """Reconstruct the *raw* feature vectors native_eval_tree expects from X
+    (which has PC/Prev_PC z-score normalized - see preprocessing.py's
+    process_pc_data()), by inverting that normalization with the per-feature
+    (mean, std) pairs in feature_normalization_cache. Every other feature
+    passes through unchanged. Used both by main.py's training workers (to
+    hand back plain, picklable feature rows for the parity test, since the
+    fitted model object itself can't cross the subprocess boundary - see
+    _fit_and_convert_worker's docstring) and by test_c_parity.py (to build
+    the C test harness's input rows).
+    """
+    feat_rows = []
+    for _, row in X.iterrows():
+        feat = [0.0] * len(FEATURE_INDEX)
+        for col, idx in FEATURE_INDEX.items():
+            if col not in X.columns:
+                continue
+            v = row[col]
+            if col in feature_normalization_cache:
+                mean, std = feature_normalization_cache[col]
+                v = v * std + mean
+            feat[idx] = float(v)
+        feat_rows.append(feat)
+    return feat_rows
+
+
 def _pc_to_int(pc) -> int:
     """PC values are hex strings without a '0x' prefix (e.g. '7ffff57922ed')."""
     return int(pc, 16) if isinstance(pc, str) else int(pc)
@@ -135,9 +161,29 @@ def convert_models_to_c_code(pc_to_model_map: dict, feature_normalization_cache_
 
     c_code = ""
     node_counts = {}
+    converted_entries = []
     for pc_int, model, category, norm_cache in pc_entries:
-        c_code += convert_tree_to_c_code(pc_int, model, norm_cache, category)
+        # walk_tree() only understands "<=" (numeric threshold) splits.
+        # pystreed's binarizer emits "== value" for a feature that has
+        # exactly 2 distinct values in this PC's local training data, and
+        # "in [...]" for a handful of categories - both real, expected
+        # outputs from pystreed itself (see Binarizer.fit() in
+        # pystreed/binarizer.py), not malformed input. The native C tree
+        # format/native_eval_tree() only supports <=, so a PC whose tree
+        # contains one of these splits can't be represented - skip it
+        # (same as a PC with no trained tree at all: get_native_nodes()
+        # returns NULL, candidate treated as not prefetchable) rather than
+        # crashing the whole codegen run over one PC's degenerate feature
+        # distribution.
+        try:
+            tree_code = convert_tree_to_c_code(pc_int, model, norm_cache, category)
+        except ValueError as e:
+            print(f"skipping PC 0x{pc_int:x} ({category}): unsupported split ({e})")
+            continue
+        c_code += tree_code
         node_counts[pc_int] = len(walk_tree(model, {}))
+        converted_entries.append((pc_int, model, category, norm_cache))
+    pc_entries = converted_entries
 
     c_code += "static const native_tree_node_t* get_native_nodes(uint64_t pc, int* num_nodes) {\n"
     c_code += "    switch (pc) {\n"
@@ -154,6 +200,41 @@ def convert_models_to_c_code(pc_to_model_map: dict, feature_normalization_cache_
     c_code = header + c_code
 
     return c_code
+
+def assemble_header_from_c_fragments(pc_code_map: dict, category: str) -> str:
+    """Assemble a header from already-generated per-PC C code fragments.
+
+    pc_code_map: {pc: (c_code_str, num_nodes)} for the given category - each
+    fragment was produced by convert_tree_to_c_code(pc, ..., category)
+    already (see main.py's _fit_and_convert_worker(), which runs
+    fit()+convert_tree_to_c_code() together inside a subprocess so a
+    pystreed native crash on one PC can't take down the whole training
+    run). This just concatenates the fragments and adds the
+    get_native_nodes() router, mirroring convert_models_to_c_code() but
+    skipping tree-walking work that's already done.
+
+    Call once per category, same reasoning as convert_models_to_c_code():
+    combining spatial and pointer PCs in one call could emit duplicate
+    `case 0x...:` labels if the same PC appears in both.
+    """
+    c_code = c_header()
+    for pc, (fragment, _num_nodes) in pc_code_map.items():
+        c_code += fragment
+
+    c_code += "static const native_tree_node_t* get_native_nodes(uint64_t pc, int* num_nodes) {\n"
+    c_code += "    switch (pc) {\n"
+    for pc, (_fragment, num_nodes) in pc_code_map.items():
+        pc_int = _pc_to_int(pc)
+        c_code += f"        case 0x{pc_int:x}:\n"
+        c_code += f"            *num_nodes = {num_nodes};\n"
+        c_code += f"            return native_nodes_{category}_{pc_int:x};\n"
+    c_code += "        default:\n"
+    c_code += "            *num_nodes = 0;\n"
+    c_code += "            return NULL;\n"
+    c_code += "    }\n"
+    c_code += "}\n"
+    return c_code
+
 
 def c_header():
     header = ""

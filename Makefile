@@ -216,12 +216,37 @@ XGBOOST_LINK_FLAGS = -Wl,--whole-archive $(XGBOOST_LIBS) -Wl,--no-whole-archive 
 endif
 endif
 
+# per-PC single-tree native prefetcher (opt-in: make fltrace.so DO_PREFETCH=1
+# NATIVE_ONLY=1 DO_PREFETCH_SINGLE_TREE=1). Swaps native_predict_{spatial,
+# pointer}.c's shared XGBoost-ensemble trees for single_tree_predict_{spatial,
+# pointer}.c's one-tiny-tree-per-PC approach (see
+# tools/fltrace/single_tree_codegen/README.md) - mutually exclusive with the
+# ensemble path, enforced by native_predict_{spatial,pointer}.c's own
+# DO_PREFETCH_SINGLE_TREE-excluding guard (both files define the same
+# native_predict_batch_{spatial,pointer}() symbols, so having both compile
+# their bodies in at once would be a duplicate-symbol link error). Still
+# requires NATIVE_ONLY=1 (and thus DO_PREFETCH=1) since xgboost_prefetcher.c's
+# NATIVE_ONLY branch is what calls into native_predict_batch_{spatial,
+# pointer}() at all, regardless of which .c file provides them.
+ifneq ($(DO_PREFETCH_SINGLE_TREE),)
+CFLAGS += -DDO_PREFETCH_SINGLE_TREE
+endif
+
 # raw pc/pointer-content tracing for collecting prefetcher training data
 # (opt-in: make fltrace.so DO_TRACING=1). dumps one line per fault with its
 # page address, faulting address and pc, plus one line per nonzero pointer
 # candidate found on the faulted page - see benchmarks/ll/README.md.
 ifneq ($(DO_TRACING),)
 CFLAGS += -DDO_TRACING
+endif
+
+# direct wall-clock measurement of handle_page_fault() via clock_gettime()
+# (opt-in: make fltrace.so DO_FAULT_TIMING=1). Prints one line per call in
+# microseconds for the first FAULT_TIMING_LIMIT calls, for reading raw
+# per-fault numbers directly instead of inferring from rdtsc()/assumed
+# cycles-per-us - see rmem/fault.c.
+ifneq ($(DO_FAULT_TIMING),)
+CFLAGS += -DDO_FAULT_TIMING
 endif
 
 # RDMA backend support (opt-in: make fltrace.so RDMA=1). Needed to select

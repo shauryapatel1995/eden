@@ -20,26 +20,29 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_OUT_DIR = os.path.dirname(_THIS_DIR)
 
 from main import main as train_models  # noqa: E402
-from pystreed_to_c import convert_models_to_c_code  # noqa: E402
+from pystreed_to_c import assemble_header_from_c_fragments  # noqa: E402
 
 
 def generate(filename: str, top_n: int, min_support: int, out_dir: str) -> None:
-    pc_to_model_map, pc_to_normalization_cache_map = train_models(filename, top_n, min_support)
+    # {'spatial': {pc: (c_code_str, num_nodes, feat_rows, y_pred)}, 'pointer':
+    # {...}} - each PC's tree was already fit and converted to C inside its
+    # own subprocess (see main.py), so there's no model object left to walk
+    # here, just fragments to assemble. feat_rows/y_pred are only there for
+    # test_c_parity.py; the real codegen path only needs (c_code, num_nodes).
+    pc_code_map = train_models(filename, top_n, min_support)
 
     os.makedirs(out_dir, exist_ok=True)
     for category in ("spatial", "pointer"):
-        models = pc_to_model_map.get(category, {})
-        if not models:
+        entries = {pc: (c_code, num_nodes)
+                   for pc, (c_code, num_nodes, *_rest) in pc_code_map.get(category, {}).items()}
+        if not entries:
             print(f"no {category} models trained, skipping")
             continue
-        # one category per call - a PC that ended up with both a spatial and
-        # a pointer tree would otherwise collide as two `case 0x...:` labels
-        # in the same get_native_nodes() switch
-        c_code = convert_models_to_c_code({category: models}, pc_to_normalization_cache_map)
+        c_code = assemble_header_from_c_fragments(entries, category)
         out_path = os.path.join(out_dir, f"native_tree_model_{category}.h")
         with open(out_path, "w") as f:
             f.write(c_code)
-        print(f"wrote {out_path} ({len(models)} PCs)")
+        print(f"wrote {out_path} ({len(entries)} PCs)")
 
 
 if __name__ == "__main__":

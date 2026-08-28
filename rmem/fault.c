@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifdef DO_FAULT_TIMING
+#include <time.h>
+#endif
 
 #include "base/list.h"
 #include "rmem/backend.h"
@@ -20,6 +23,15 @@
 #include "rmem/stats.h"
 #include "rmem/uffd.h"
 #include "rmem/prefetch.h"
+
+#if defined(DO_FAULT_TIMING) && defined(DO_PREFETCH)
+/* direct clock_gettime()-based measurement of page_postfetch() (the
+ * pointer-chase prefetcher), printed raw in microseconds - see fault_done()
+ * below. Capped so a full multi-million-fault run doesn't produce an
+ * unusably huge log. */
+#define FAULT_TIMING_LIMIT 100000
+static long postfetch_timing_count = 0;
+#endif
 
 /* fault handling common state */
 __thread void* zero_page = NULL;
@@ -433,7 +445,22 @@ void fault_done(fault_t* f, int chan_id, int *nevicts_needed)
      * single handler thread, which can't poll for the next real uffd
      * fault while it's in here - see RSTAT_PREFETCH_SCAN_CYCLES */
     postfetch_start_tsc = rdtsc();
+#ifdef DO_FAULT_TIMING
+    struct timespec __pf_ts1, __pf_ts2;
+    bool __pf_do_time = postfetch_timing_count < FAULT_TIMING_LIMIT;
+    if (__pf_do_time)
+        clock_gettime(CLOCK_MONOTONIC, &__pf_ts1);
+#endif
     page_postfetch(f, features, responses, chan_id, nevicts_needed);
+#ifdef DO_FAULT_TIMING
+    if (__pf_do_time) {
+        clock_gettime(CLOCK_MONOTONIC, &__pf_ts2);
+        long __pf_us = (__pf_ts2.tv_sec - __pf_ts1.tv_sec) * 1000000L +
+            (__pf_ts2.tv_nsec - __pf_ts1.tv_nsec) / 1000L;
+        fprintf(stderr, "page_postfetch: %ld us\n", __pf_us);
+        postfetch_timing_count++;
+    }
+#endif
     RSTAT(PREFETCH_SCAN_CYCLES) += rdtsc() - postfetch_start_tsc;
 #endif
 
