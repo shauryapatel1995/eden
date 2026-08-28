@@ -548,7 +548,7 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
     assert(nevicts_needed);
     *nevicts_needed = 0;
 
-    /* see if this fault needs to be acted upon, because some other fault 
+    /* see if this fault needs to be acted upon, because some other fault
      * on the same page might have handled it by now */
     if (is_fault_serviced(fault, /*page locked=*/ false)) {
         /* some other fault (or a prefetch) already resolved the page by

@@ -116,7 +116,8 @@ def run_parity_check() -> bool:
     # (see main.py); feat_rows/y_pred are that same subprocess's own
     # held-out predictions, handed back as plain data since the model
     # object itself can't cross the process boundary.
-    pc_code_map = train_models(csv_path, top_n=len(SPATIAL_PCS) + len(POINTER_PCS), min_support=0)
+    pc_code_map = train_models(csv_path, top_n=len(SPATIAL_PCS) + len(POINTER_PCS), min_support=0,
+                                max_depth=2, max_num_nodes=10)
 
     all_ok = True
     for category in ("spatial", "pointer"):
