@@ -435,11 +435,13 @@ void fault_done(fault_t* f, int chan_id, int *nevicts_needed)
     unsigned long postfetch_start_tsc;
 #endif
 
-#ifdef DO_PREFETCH
+#if defined(DO_PREFETCH) || defined(DO_PREFETCH_LEAP)
     /* bump once per real fault serviced, before this fault's own prefetches
      * (if any) get staged - see prefetch_fault_counter in common.h */
     atomic64_add_and_fetch(&prefetch_fault_counter, 1);
+#endif
 
+#ifdef DO_PREFETCH
     /* speculatively prefetch pointer-chase candidates off the page we just
      * finished servicing, before releasing its lock. this runs on the
      * single handler thread, which can't poll for the next real uffd
@@ -745,6 +747,10 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
              * this fault before fault_done() runs, so accessing it here is
              * safe; see page_prefetch_spatial() in prefetch.c) */
             page_prefetch_spatial(fault, chan_id);
+#endif
+#ifdef DO_PREFETCH_LEAP
+            /* Leap baseline: address-only, so it runs at the same point */
+            page_prefetch_leap(fault, chan_id);
 #endif
 
             status = FAULT_READ_POSTED;

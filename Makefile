@@ -232,6 +232,18 @@ ifneq ($(DO_PREFETCH_SINGLE_TREE),)
 CFLAGS += -DDO_PREFETCH_SINGLE_TREE
 endif
 
+# Leap prefetcher baseline (opt-in: make fltrace.so DO_PREFETCH_LEAP=1).
+# Address-only majority-stride prefetcher ported from DiLOS (see
+# rmem/prefetch_leap.c), for comparison against the learned prefetchers.
+# Needs no model or libxgboost. Mutually exclusive with DO_PREFETCH, since
+# both prefetch from the same point in handle_page_fault().
+ifneq ($(DO_PREFETCH_LEAP),)
+ifneq ($(DO_PREFETCH),)
+$(error DO_PREFETCH_LEAP and DO_PREFETCH are mutually exclusive)
+endif
+CFLAGS += -DDO_PREFETCH_LEAP
+endif
+
 # raw pc/pointer-content tracing for collecting prefetcher training data
 # (opt-in: make fltrace.so DO_TRACING=1). dumps one line per fault with its
 # page address, faulting address and pc, plus one line per nonzero pointer

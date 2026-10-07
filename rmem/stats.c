@@ -29,6 +29,10 @@ const char *rstat_names[] = {
     "prefetch_spatial_prefetches",
     "prefetch_backend_busy",
     "prefetch_skipped_stop_early",
+    "leap_prefetches",
+    "leap_hits",
+    "leap_trend_found",
+    "leap_no_trend",
 
     /* eviction stats */
     "evict_ops",

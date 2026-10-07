@@ -68,6 +68,14 @@ enum {
                                           * measure of how many potentially-
                                           * useful prefetches "stop_early"
                                           * costs us */
+    RSTAT_LEAP_PREFETCHES,              /* Leap baseline (DO_PREFETCH_LEAP):
+                                          * prefetch reads posted */
+    RSTAT_LEAP_HITS,                    /* prefetched pages the app moved
+                                          * past without faulting (inferred,
+                                          * see prefetch_leap.c) */
+    RSTAT_LEAP_TREND_FOUND,             /* faults with a majority stride */
+    RSTAT_LEAP_NO_TREND,                /* faults that fell back to
+                                          * sequential readahead */
 
     /* eviction stats */
     RSTAT_EVICTS,

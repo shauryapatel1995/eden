@@ -81,7 +81,7 @@ static int prefetch_act(fault_t *f, int chan_id, uint64_t *compact_ptr_val,
  * see this contribution via the shared memory_used counter and compute
  * the correctly-combined eviction need from there, so setting it here too
  * would just get overwritten. */
-static void prefetch_book_pressure(fault_t *f, int nprefetches)
+void prefetch_book_pressure(fault_t *f, int nprefetches)
 {
     unsigned long long pressure;
 

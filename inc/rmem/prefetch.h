@@ -35,5 +35,8 @@ unsigned long page_prefetch_preds(FeatureVector features[], int *response_arr, i
 unsigned long page_postfetch_preds(FeatureVector features[], int *response_arr, int batch_size);
 unsigned long page_postfetch(fault_t *f, FeatureVector features[], int *response_arr, int chan_id, int *nevicts_needed);
 void page_prefetch_spatial(fault_t *f, int chan_id);
+void prefetch_book_pressure(fault_t *f, int nprefetches);
+/* Leap baseline (DO_PREFETCH_LEAP) - see rmem/prefetch_leap.c */
+void page_prefetch_leap(fault_t *f, int chan_id);
 
 #endif // __PREFETCH_H
