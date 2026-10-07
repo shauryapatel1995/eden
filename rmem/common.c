@@ -40,6 +40,11 @@ atomic64_t memory_freed = ATOMIC_INIT(0);
 atomic64_t prefetch_fault_counter = ATOMIC_INIT(0);
 bool rmem_inited = false;
 
+#ifdef DO_IDEAL_PREFETCH_SIM
+uint64_t ideal_prefetch_delay_us = 0;
+atomic64_t ideal_prefetch_read_counter = ATOMIC_INIT(0);
+#endif
+
 /* variable to track whether we are in the runtime or application at 
  * any point in time; this is used to track internal vs external 
  * memory allocations when interposing on memory calls */

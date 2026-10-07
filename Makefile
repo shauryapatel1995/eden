@@ -249,6 +249,19 @@ ifneq ($(DO_FAULT_TIMING),)
 CFLAGS += -DDO_FAULT_TIMING
 endif
 
+# idealized-prefetcher simulation (opt-in: make fltrace.so
+# DO_IDEAL_PREFETCH_SIM=1). LOCAL-backend only - injects an artificial
+# per-completion delay (FLTRACE_IDEAL_PREFETCH_DELAY_US env var,
+# microseconds) on exactly 1 in every 8 real-fault reads, leaving the other
+# 7 free - simulating a perfect prefetcher that always correctly prefetches
+# 7 of every 8 pages ahead of need, paying only the cost of the page it
+# didn't get to in time. Used to find the RDMA-latency threshold beyond
+# which even an ideal prefetcher can't beat a no-prefetch baseline - see
+# rmem/rmem_local.c's local_post_read()/local_check_cq().
+ifneq ($(DO_IDEAL_PREFETCH_SIM),)
+CFLAGS += -DDO_IDEAL_PREFETCH_SIM
+endif
+
 # RDMA backend support (opt-in: make fltrace.so RDMA=1). Needed to select
 # FLTRACE_RMEM_BACKEND=rdma at runtime instead of the default local backend.
 # Kept out of the default build: linking -lrdmacm/-libverbs pulls in
