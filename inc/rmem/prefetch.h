@@ -36,6 +36,13 @@ unsigned long page_postfetch_preds(FeatureVector features[], int *response_arr, 
 unsigned long page_postfetch(fault_t *f, FeatureVector features[], int *response_arr, int chan_id, int *nevicts_needed);
 void page_prefetch_spatial(fault_t *f, int chan_id);
 void prefetch_book_pressure(fault_t *f, int nprefetches);
+/* whether a fault at this PC can produce any spatial/pointer prediction -
+ * always true unless a per-PC predictor backend (PySTreeD) overrides it.
+ * Returns int, not bool: eden's base/types.h makes bool an int while the
+ * PySTreeD files see stdbool's 1-byte _Bool, and a _Bool return read as an
+ * int picks up garbage in the upper bytes of %eax */
+int prefetch_pc_has_model_spatial(uint64_t pc);
+int prefetch_pc_has_model_pointer(uint64_t pc);
 /* Leap baseline (DO_PREFETCH_LEAP) - see rmem/prefetch_leap.c */
 void page_prefetch_leap(fault_t *f, int chan_id);
 

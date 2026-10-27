@@ -68,6 +68,12 @@ enum {
                                           * measure of how many potentially-
                                           * useful prefetches "stop_early"
                                           * costs us */
+    RSTAT_PREFETCH_NO_MODEL_SKIPS,      /* faults whose pointer scan was
+                                          * skipped: no pointer model for
+                                          * the faulting PC */
+    RSTAT_PREFETCH_SPATIAL_NO_MODEL_SKIPS, /* same for the spatial stage */
+    RSTAT_PREFETCH_ZERO_PAGE_SKIPS,     /* faults whose pointer scan was
+                                          * skipped: served a zero page */
     RSTAT_LEAP_PREFETCHES,              /* Leap baseline (DO_PREFETCH_LEAP):
                                           * prefetch reads posted */
     RSTAT_LEAP_HITS,                    /* prefetched pages the app moved

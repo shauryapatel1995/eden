@@ -20,6 +20,7 @@
 
 #ifdef DO_PREFETCH_SINGLE_TREE
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <math.h>
 #include "rmem/common.h"
@@ -34,6 +35,21 @@
 #define NATIVE_FEATURE_PREV_PC 4
 #define NATIVE_FEATURE_PREV_DELTA 5
 #define NUM_FEATURES_NATIVE 6
+
+/*
+ * Whether a fault at this PC could ever get a positive pointer prediction:
+ * false if the PC has no trained pointer tree, or its tree is a single
+ * "don't prefetch" leaf. Checked once per fault (see prefetch.c) so faults
+ * at such PCs skip candidate generation entirely instead of building and
+ * gating candidates that native_predict_batch_pointer() would reject anyway.
+ * Overrides the always-true weak default in rmem/prefetch.c.
+ */
+int prefetch_pc_has_model_pointer(uint64_t pc)
+{
+    int num_nodes;
+    const native_tree_node_t *nodes = get_native_nodes(pc, &num_nodes);
+    return nodes && !(num_nodes == 1 && nodes[0].feature < 0 && nodes[0].leaf_value == 0.0f);
+}
 
 /*
  * Batched native prediction.

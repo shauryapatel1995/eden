@@ -30,7 +30,8 @@ typedef struct fault {
     uint8_t locked_pages:1;         /* if the fault locked any pages */
     uint8_t stolen_from_cq:1;       /* stole this fault from other's cq */
     uint8_t uffd_explicit_wake:1;   /* need to issue uffd_wake() after done */
-    uint8_t unused1:1;
+    uint8_t zero_page:1;            /* served as a fresh zero page (first
+                                     * touch): nothing on it to prefetch from */
 
     uint8_t rdahead_max;        /* suggested max read-ahead */
     uint8_t rdahead;            /* actual read-ahead locked for this fault */

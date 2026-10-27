@@ -19,6 +19,12 @@
 #include "rmem/fault.h"
 #include <sys/time.h>
 
+/* default for predictor backends without per-PC models (the XGBoost
+ * ensemble scores every PC): any PC may produce a prediction. The PySTreeD
+ * backend overrides these in tools/fltrace/single_tree_predict_*.c. */
+__attribute__((weak)) int prefetch_pc_has_model_spatial(uint64_t pc) { return true; }
+__attribute__((weak)) int prefetch_pc_has_model_pointer(uint64_t pc) { return true; }
+
 /* act on gated+scored candidates: post a prefetch read for every positive
  * prediction, releasing the is_page_prefetchable() lock on everything else
  * (or on everything, once backend-busy forces an early stop). Shared by
@@ -114,6 +120,12 @@ void page_prefetch_spatial(fault_t *f, int chan_id)
      * page_postfetch()'s faulting_location below */
     int faulting_location = (f->faulting_addr - f->page) / sizeof(uint64_t);
 
+    /* no spatial model for this PC: nothing could be predicted positive */
+    if (!prefetch_pc_has_model_spatial(f->pc)) {
+        RSTAT(PREFETCH_SPATIAL_NO_MODEL_SKIPS)++;
+        return;
+    }
+
     unsigned long spatial_start_tsc = rdtsc();
 
     /* Setup next-N features - pure address arithmetic, no page content.
@@ -188,6 +200,12 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
     int ncandidates = 0;
 
     assert(f->page);
+    /* no pointer model for this PC: skip scanning and gating its 512 slots,
+     * every candidate would be predicted "don't prefetch" anyway */
+    if (!prefetch_pc_has_model_pointer(f->pc)) {
+        RSTAT(PREFETCH_NO_MODEL_SKIPS)++;
+        return 0;
+    }
     /* Setup pointer features. delta can't be filled in here yet (would be
      * (*ptr - f->page) / CHUNK_SIZE) - it needs the real pointer value off
      * the faulted page, which Pass 1 below reads anyway to compute ptr_val
