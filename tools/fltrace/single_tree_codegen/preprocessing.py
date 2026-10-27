@@ -80,6 +80,11 @@ def process_pc_data(pc_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, dic
 
     feature_normalization_cache = {}
     feature_normalization_cache['Prev_PC'] = (mean, std)
+    # the distinct raw Prev_PC values, so pystreed_to_c.py can turn a
+    # Prev_PC split back into the exact sets of addresses on each side
+    # (a numeric threshold on 47-bit addresses doesn't survive float
+    # conversion or per-library remapping - see walk_tree())
+    feature_normalization_cache['Prev_PC_values'] = sorted(set(prev_pcs))
 
     # Same treatment for PC - constant within this function's single-PC
     # input (mean == the one value, std == 0), so normalize_big_numbers'
@@ -92,6 +97,7 @@ def process_pc_data(pc_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, dic
     data['PC'] = pcs_normalized
     data['PC'] = data['PC'].astype('float64')
     feature_normalization_cache['PC'] = (pc_mean, pc_std)
+    feature_normalization_cache['PC_values'] = sorted(set(pcs))
 
     if data['Type'].iloc[0] == 0:
         INPUT_COLS = SPATIAL_COLS

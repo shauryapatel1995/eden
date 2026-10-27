@@ -21,7 +21,7 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_OUT_DIR = os.path.dirname(_THIS_DIR)
 
 from main import main as train_models  # noqa: E402
-from pystreed_to_c import assemble_header_from_c_fragments  # noqa: E402
+from pystreed_to_c import assemble_header_from_c_fragments, empty_header  # noqa: E402
 
 
 def generate(filename: str, top_n: int, min_support: int, max_depth: int, max_num_nodes: int, out_dir: str, f_beta: float = 1.0) -> None:
@@ -36,10 +36,13 @@ def generate(filename: str, top_n: int, min_support: int, max_depth: int, max_nu
     for category in ("spatial", "pointer"):
         entries = {pc: (c_code, num_nodes)
                    for pc, (c_code, num_nodes, *_rest) in pc_code_map.get(category, {}).items()}
-        if not entries:
-            print(f"no {category} models trained, skipping")
-            continue
-        c_code = assemble_header_from_c_fragments(entries, category)
+        if entries:
+            c_code = assemble_header_from_c_fragments(entries, category)
+        else:
+            # still write a header: every PC gets "no tree", so the runtime
+            # skips this stage (single_tree_predict_*.c needs one to build)
+            print(f"no {category} models trained, writing an empty header")
+            c_code = empty_header(category)
         out_path = os.path.join(out_dir, f"native_tree_model_{category}.h")
         with open(out_path, "w") as f:
             f.write(c_code)
@@ -56,8 +59,13 @@ if __name__ == "__main__":
     parser.add_argument("--out_dir", type=str, default=_DEFAULT_OUT_DIR,
                          help="Directory to write native_tree_model_{spatial,pointer}.h into "
                               "(default: tools/fltrace/, alongside single_tree_predict_*.c)")
+    parser.add_argument("--integer_bounds", action="store_true",
+                        help="emit integer box bounds and no floating point (for the kernel module)")
     parser.add_argument("--f_beta", type=float, default=1.0,
                         help="Beta for F-beta score (0.5 = precision-weighted, 1.0 = F1, 2.0 = recall-weighted)")
     args = parser.parse_args()
+    if args.integer_bounds:
+        # read by pystreed_to_c.py, including in main.py's training subprocesses
+        os.environ["ST_INTEGER_BOUNDS"] = "1"
 
     generate(args.filename, args.top_n, args.min_support, args.max_depth, args.max_num_nodes, args.out_dir, args.f_beta)

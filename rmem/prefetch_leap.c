@@ -188,6 +188,7 @@ void page_prefetch_leap(fault_t *f, int chan_id)
     long stride;
     int hits, window, k, nprefetches = 0;
 
+    unsigned long start_tsc = rdtsc();
     hits = leap_infer_hits(pgoff);
     RSTAT(LEAP_HITS) += hits;
     leap_hist_push(pgoff);
@@ -199,6 +200,9 @@ void page_prefetch_leap(fault_t *f, int chan_id)
         RSTAT(LEAP_NO_TREND)++;
         stride = (leap_have_prev && pgoff < leap_prev_pgoff) ? -1 : 1;
     }
+
+    unsigned long act_tsc = rdtsc();
+    RSTAT(LEAP_DECIDE_CYCLES) += act_tsc - start_tsc;
 
     leap_last_batch_len = 0;
     for (k = 1; k <= window; k++) {
@@ -225,6 +229,7 @@ void page_prefetch_leap(fault_t *f, int chan_id)
 
     RSTAT(LEAP_PREFETCHES) += nprefetches;
     prefetch_book_pressure(f, nprefetches);
+    RSTAT(LEAP_ACT_CYCLES) += rdtsc() - act_tsc;
 
     leap_last_stride = stride;
     leap_prev_pgoff = pgoff;

@@ -22,7 +22,7 @@ from pystreed import STreeDClassifier
 from preprocessing import load_and_filter_data
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, fbeta_score
-from pystreed_to_c import convert_tree_to_c_code, walk_tree, denormalize_feat_rows
+from pystreed_to_c import convert_tree_to_c_code, walk_tree, tree_to_boxes, denormalize_feat_rows
 
 # STreeDClassifier's fitted model wraps a C++ solver result that can't be
 # pickled (confirmed: pickling raises "cannot pickle
@@ -73,7 +73,9 @@ def _fit_and_convert_worker(pc, X, y, category, feature_normalization_cache, res
         with open(result_path, "wb") as f:
             pickle.dump(('unsupported_split', str(e)), f)
         return
-    num_nodes = len(walk_tree(model, feature_normalization_cache))
+    # the router needs the number of positive-leaf boxes (0 = this PC's
+    # tree never predicts positive, so it gets no model at all)
+    num_nodes = len(tree_to_boxes(walk_tree(model, feature_normalization_cache)))
     # test_c_parity.py needs "Python's own predictions" to diff the C output
     # against, but the fitted model object can't leave this subprocess (see
     # module docstring) - hand back the plain, picklable ingredients instead
@@ -81,7 +83,8 @@ def _fit_and_convert_worker(pc, X, y, category, feature_normalization_cache, res
     # computed here where the model still exists.
     feat_rows = denormalize_feat_rows(X_test, feature_normalization_cache)
     with open(result_path, "wb") as f:
-        pickle.dump(('ok', report, c_code, num_nodes, feat_rows, [int(p) for p in y_pred]), f)
+        pickle.dump(('ok', report, c_code, num_nodes, feat_rows, [int(p) for p in y_pred],
+                     walk_tree(model, feature_normalization_cache)), f)
 
 
 def main(filename: str, top_n: int, min_support: int, max_depth: int, max_num_nodes: int, f_beta: float = 1.0):
@@ -126,11 +129,11 @@ def main(filename: str, top_n: int, min_support: int, max_depth: int, max_num_no
             print(f"SKIPPING PC {pc} ({ds_type}): unsupported split ({result[1]})", flush=True)
             continue
 
-        _, report, c_code, num_nodes, feat_rows, y_pred = result
+        _, report, c_code, num_nodes, feat_rows, y_pred, node_list = result
         print(f"Trained model for PC {pc} (f_beta={f_beta})", flush=True)
         print(report, flush=True)
 
-        entry = (c_code, num_nodes, feat_rows, y_pred)
+        entry = (c_code, num_nodes, feat_rows, y_pred, node_list)
         if ds_type == 'spatial':
             pc_code_spatial[pc] = entry
         elif ds_type == 'pointer':

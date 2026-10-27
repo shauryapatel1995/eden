@@ -7,17 +7,18 @@ typedef struct {
      * 0x7ffff579288d) - uint32_t would silently truncate to the low 32
      * bits, a completely different number than what training saw (PC was
      * read as a full hex string -> int -> float64, never truncated). Must
-     * stay wide enough to hold the real value un-truncated; the eventual
-     * (float) cast at inference time only rounds to float32 precision,
-     * which is a pre-existing, already-validated approximation shared by
-     * every other feature on the native-tree path - not the same thing as
-     * losing the high bits outright. */
+     * stay wide enough to hold the real value un-truncated; the PySTreeD
+     * trees compare PC/prev_pc as exact 64-bit addresses (a float can only
+     * tell 47-bit addresses apart 8MB at a time). delta/prev_delta are whole
+     * page counts (training's Delta/4096 and Prev_delta/4096, truncated
+     * toward zero), computed with integer division and kept as double so
+     * they stay exact - a float of the byte difference rounds beyond 16MB. */
     uint64_t pc;
     int offset;
-    float delta;
+    double delta;
     int offset_from_faulting;
     uint64_t prev_pc;
-    float prev_delta;
+    double prev_delta;
 } FeatureVector;
 
 typedef struct {
@@ -43,6 +44,14 @@ void prefetch_book_pressure(fault_t *f, int nprefetches);
  * int picks up garbage in the upper bytes of %eax */
 int prefetch_pc_has_model_spatial(uint64_t pc);
 int prefetch_pc_has_model_pointer(uint64_t pc);
+#ifdef DO_PREFETCH_SINGLE_TREE
+/* PySTreeD fast paths - see tools/fltrace/single_tree_predict_*.c */
+int single_tree_spatial_mask(uint64_t pc, uint64_t prev_pc, double prev_delta,
+                             int faulting_location);
+int single_tree_pointer_candidates(uint64_t pc, uint64_t prev_pc, double prev_delta,
+                                   int faulting_location, const uint64_t *page_data,
+                                   uint64_t page_addr, uint64_t *ptr_pages, int *nread);
+#endif
 /* Leap baseline (DO_PREFETCH_LEAP) - see rmem/prefetch_leap.c */
 void page_prefetch_leap(fault_t *f, int chan_id);
 

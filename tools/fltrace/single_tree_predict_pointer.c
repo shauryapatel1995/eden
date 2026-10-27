@@ -28,57 +28,63 @@
 #include "native_tree_model_pointer.h"
 #include "native_tree_eval.h"
 
-#define NATIVE_FEATURE_PC 0
-#define NATIVE_FEATURE_OFFSET 1
-#define NATIVE_FEATURE_DELTA 2
-#define NATIVE_FEATURE_OFFSET_FROM_FAULTING 3
-#define NATIVE_FEATURE_PREV_PC 4
-#define NATIVE_FEATURE_PREV_DELTA 5
-#define NUM_FEATURES_NATIVE 6
-
 /*
  * Whether a fault at this PC could ever get a positive pointer prediction:
- * false if the PC has no trained pointer tree, or its tree is a single
- * "don't prefetch" leaf. Checked once per fault (see prefetch.c) so faults
- * at such PCs skip candidate generation entirely instead of building and
- * gating candidates that native_predict_batch_pointer() would reject anyway.
- * Overrides the always-true weak default in rmem/prefetch.c.
+ * false if the PC has no trained pointer tree, or its tree has no positive
+ * leaf. Checked once per fault (see prefetch.c). Overrides the always-true
+ * weak default in rmem/prefetch.c.
  */
 int prefetch_pc_has_model_pointer(uint64_t pc)
 {
-    int num_nodes;
-    const native_tree_node_t *nodes = get_native_nodes(pc, &num_nodes);
-    return nodes && !(num_nodes == 1 && nodes[0].feature < 0 && nodes[0].leaf_value == 0.0f);
+    st_model_t m;
+    return st_pointer_lookup(pc, &m);
 }
 
 /*
- * Batched native prediction.
+ * The pointer stage for one fault, prediction first: resolve the fault-level
+ * conditions once (model->fault()), then scan only the slots the active
+ * boxes allow (st_pointer_scan() in native_tree_eval.h). Features match
+ * training's collect_pointers(): Offset = slot index, Offset_from_faulting =
+ * slot - faulting slot, Delta = (pointed-to page - faulting page) in pages.
+ */
+int single_tree_pointer_candidates(uint64_t pc, uint64_t prev_pc, double prev_delta,
+                                   int faulting_location, const uint64_t *page_data,
+                                   uint64_t page_addr, uint64_t *ptr_pages, int *nread)
+{
+    st_model_t m;
+
+    *nread = 0;
+    if (!st_pointer_lookup(pc, &m))
+        return 0;
+    uint32_t active = m.fault(pc, prev_pc, prev_delta);
+    if (!active)
+        return 0;
+    return st_pointer_scan(&m, active, faulting_location, page_data, page_addr, CHUNK_SIZE,
+                           ptr_pages, nread);
+}
+
+/*
+ * Batched prediction (the generic page_*_preds() entry point, see
+ * xgboost_prefetcher.c). Every candidate of a batch comes from the same fault,
+ * but this doesn't assume it: the model and active-box mask are recomputed
+ * whenever the PC or fault-level features change.
  */
 int native_predict_batch_pointer(FeatureVector *features_batch, int batch_size,
                           int *response_arr) {
+    st_model_t m;
+    int have = 0;
+    uint64_t pc = 0, prev_pc = 0;
+    double prev_delta = 0;
+    uint32_t active = 0;
     for (int i = 0; i < batch_size; i++) {
-        int num_nodes;
-        const native_tree_node_t *nodes = get_native_nodes(features_batch[i].pc, &num_nodes);
-        if (!nodes) {
-            /* no trained tree for this PC (see get_native_nodes() in
-             * native_tree_model_pointer.h) - not prefetchable */
-            response_arr[i] = 0;
-            continue;
+        FeatureVector *fv = &features_batch[i];
+        if (i == 0 || fv->pc != pc || fv->prev_pc != prev_pc || fv->prev_delta != prev_delta) {
+            pc = fv->pc; prev_pc = fv->prev_pc; prev_delta = fv->prev_delta;
+            have = st_pointer_lookup(pc, &m);
+            active = have ? m.fault(pc, prev_pc, prev_delta) : 0;
         }
-        float feat[NUM_FEATURES_NATIVE];
-        feat[NATIVE_FEATURE_PC] = (float)features_batch[i].pc;
-        feat[NATIVE_FEATURE_OFFSET] = (float)features_batch[i].offset;
-        /* delta already arrives in page-count units (see page_prefetch_spatial()/
-         * page_postfetch() in prefetch.c) matching training's Cand_delta/4096 -
-         * do NOT divide again here (a previous version of this file did, a
-         * 4096x double-scale that likely explains why the deployed spatial
-         * model never predicted positive on any of its candidates) */
-        feat[NATIVE_FEATURE_DELTA] = features_batch[i].delta;
-        feat[NATIVE_FEATURE_OFFSET_FROM_FAULTING] = (float)features_batch[i].offset_from_faulting;
-        feat[NATIVE_FEATURE_PREV_PC] = (float)features_batch[i].prev_pc;
-        feat[NATIVE_FEATURE_PREV_DELTA] = features_batch[i].prev_delta;
-
-        response_arr[i] = (int)native_eval_tree(nodes, feat);
+        response_arr[i] = active ? st_predict(&m, active, fv->offset, fv->offset_from_faulting,
+                                              fv->delta) : 0;
     }
     return 0;
 }
