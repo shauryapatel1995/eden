@@ -3,8 +3,8 @@
 
 fig_faults_prefetches.png: major faults and prefetched pages per config, both
     normalised to the no-prefetch major faults of the same workload.
-fig_performance.png: end-to-end performance normalised to the Linux default,
-    oriented so >1 is better (default/config for times, config/default for rates).
+fig_performance.png: end-to-end performance normalised to no prefetching,
+    oriented so >1 is better (noprefetch/config for times, config/noprefetch for rates).
 
 Bars are the median over rounds; error bars span the 2nd..4th of the 5 sorted
 rounds (inter-quartile); workloads with one round have no error bar.
@@ -88,12 +88,12 @@ ax.legend(handles, [LABELS[c] for c in CONFIGS] + ["major faults", "prefetched p
 fig.tight_layout()
 fig.savefig(os.path.join(HERE, "fig_faults_prefetches.png"), dpi=200)
 
-# ---- figure 2: performance normalised to Linux default, >1 = better ----
+# ---- figure 2: performance normalised to no prefetching, >1 = better ----
 fig, ax = plt.subplots(figsize=(16, 5))
 w = 0.15
 for i, wl in enumerate(WORKLOADS):
-    base = np.median([float(r["metric"]) for r in rows[wl, "default"]])
-    lower = rows[wl, "default"][0]["better"] == "lower"
+    base = np.median([float(r["metric"]) for r in rows[wl, "noprefetch"]])
+    lower = rows[wl, "noprefetch"][0]["better"] == "lower"
     for k, c in enumerate(CONFIGS):
         vals = [base / float(r["metric"]) if lower else float(r["metric"]) / base
                 for r in rows[wl, c]]
@@ -104,11 +104,12 @@ ax.axhline(1, color=INK2, lw=1, ls="--")
 ax.set_xticks(range(len(WORKLOADS)),
               [f"{xlabel(wl)}\n({rows[wl, 'default'][0]['metric_name']})" for wl in WORKLOADS])
 ax.set_ylim(0.6, None)
-ax.set_ylabel("Performance / Linux default (>1 is better)")
-ax.set_title("End-to-end performance normalised to the Linux default prefetcher", loc="left", fontsize=11)
+ax.set_ylabel("Performance / no prefetching (>1 is better)")
+ax.set_title("End-to-end performance normalised to no prefetching", loc="left", fontsize=11)
 style(ax)
-ax.legend([plt.Rectangle((0, 0), 1, 1, color=COLORS[c]) for c in CONFIGS],
-          [LABELS[c] for c in CONFIGS], ncol=5, frameon=False, loc="upper center",
+ax.legend([plt.Rectangle((0, 0), 1, 1, color=COLORS[c]) for c in CONFIGS]
+          + [plt.Line2D([0], [0], color=INK2, lw=1, ls="--")],
+          [LABELS[c] for c in CONFIGS] + ["no prefetching (= 1)"], ncol=6, frameon=False, loc="upper center",
           bbox_to_anchor=(0.5, -0.2), fontsize=9)
 fig.tight_layout()
 fig.savefig(os.path.join(HERE, "fig_performance.png"), dpi=200)
