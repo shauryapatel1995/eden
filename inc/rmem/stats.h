@@ -68,6 +68,24 @@ enum {
                                           * measure of how many potentially-
                                           * useful prefetches "stop_early"
                                           * costs us */
+    RSTAT_PREFETCH_NO_MODEL_SKIPS,      /* faults whose pointer scan was
+                                          * skipped: no pointer model for
+                                          * the faulting PC */
+    RSTAT_PREFETCH_SPATIAL_NO_MODEL_SKIPS, /* same for the spatial stage */
+    RSTAT_PREFETCH_ZERO_PAGE_SKIPS,     /* faults whose pointer scan was
+                                          * skipped: served a zero page */
+    RSTAT_PREFETCH_SLOTS_READ,          /* PySTreeD builds: page slots the
+                                          * pointer stage actually read (only
+                                          * those its tree could predict
+                                          * positive), out of 512 per fault */
+    RSTAT_LEAP_PREFETCHES,              /* Leap baseline (DO_PREFETCH_LEAP):
+                                          * prefetch reads posted */
+    RSTAT_LEAP_HITS,                    /* prefetched pages the app moved
+                                          * past without faulting (inferred,
+                                          * see prefetch_leap.c) */
+    RSTAT_LEAP_TREND_FOUND,             /* faults with a majority stride */
+    RSTAT_LEAP_NO_TREND,                /* faults that fell back to
+                                          * sequential readahead */
 
     /* eviction stats */
     RSTAT_EVICTS,
@@ -147,6 +165,9 @@ enum {
                                    * PREFETCH_INFER_CYCLES */
     RSTAT_PREFETCH_SPATIAL_ACT_CYCLES,   /* spatial equivalent of
                                    * PREFETCH_ACT_CYCLES */
+    RSTAT_LEAP_DECIDE_CYCLES,   /* Leap: hit inference, history, trend and
+                                  * window per fault (its "inference") */
+    RSTAT_LEAP_ACT_CYCLES,      /* Leap: gating and posting its prefetches */
     RSTAT_HANDLE_FAULT_CYCLES,  /* total handler-thread time spent inside
                                   * handle_page_fault() across every call
                                   * (fresh faults and wait-queue re-checks

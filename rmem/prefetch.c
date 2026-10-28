@@ -19,6 +19,12 @@
 #include "rmem/fault.h"
 #include <sys/time.h>
 
+/* default for predictor backends without per-PC models (the XGBoost
+ * ensemble scores every PC): any PC may produce a prediction. The PySTreeD
+ * backend overrides these in tools/fltrace/single_tree_predict_*.c. */
+__attribute__((weak)) int prefetch_pc_has_model_spatial(uint64_t pc) { return true; }
+__attribute__((weak)) int prefetch_pc_has_model_pointer(uint64_t pc) { return true; }
+
 /* act on gated+scored candidates: post a prefetch read for every positive
  * prediction, releasing the is_page_prefetchable() lock on everything else
  * (or on everything, once backend-busy forces an early stop). Shared by
@@ -81,7 +87,7 @@ static int prefetch_act(fault_t *f, int chan_id, uint64_t *compact_ptr_val,
  * see this contribution via the shared memory_used counter and compute
  * the correctly-combined eviction need from there, so setting it here too
  * would just get overwritten. */
-static void prefetch_book_pressure(fault_t *f, int nprefetches)
+void prefetch_book_pressure(fault_t *f, int nprefetches)
 {
     unsigned long long pressure;
 
@@ -114,8 +120,37 @@ void page_prefetch_spatial(fault_t *f, int chan_id)
      * page_postfetch()'s faulting_location below */
     int faulting_location = (f->faulting_addr - f->page) / sizeof(uint64_t);
 
+    /* no spatial model for this PC: nothing could be predicted positive */
+    if (!prefetch_pc_has_model_spatial(f->pc)) {
+        RSTAT(PREFETCH_SPATIAL_NO_MODEL_SKIPS)++;
+        return;
+    }
+
     unsigned long spatial_start_tsc = rdtsc();
 
+#ifdef DO_PREFETCH_SINGLE_TREE
+    /* PySTreeD builds: predict the 4 next pages first (one per-fault
+     * evaluation of the tree's fault-level conditions, see
+     * single_tree_spatial_mask()), then gate only the predicted ones */
+    (void)features;
+    pass_start_tsc = rdtsc();
+    int mask = single_tree_spatial_mask(f->pc, f->prev_pc,
+        (double)(f->prev_delta / (int64_t)CHUNK_SIZE), faulting_location);
+    RSTAT(PREFETCH_SPATIAL_INFER_CYCLES) += rdtsc() - pass_start_tsc;
+    RSTAT(PREFETCH_SPATIAL_CANDIDATES_POSITIVE) += __builtin_popcount(mask);
+
+    pass_start_tsc = rdtsc();
+    for (int i = 0; i < 4; i++) {
+        uint64_t candidate = (f->page + (i + 1) * CHUNK_SIZE) & ~CHUNK_MASK;
+        if (((mask >> i) & 1) && is_page_prefetchable(f, candidate)) {
+            ptr_val[ncandidates] = candidate;
+            responses[ncandidates] = 1;
+            ncandidates++;
+        }
+    }
+    RSTAT(PREFETCH_SPATIAL_GATE_CYCLES) += rdtsc() - pass_start_tsc;
+    RSTAT(PREFETCH_SPATIAL_CANDIDATES_GATED) += ncandidates;
+#else
     /* Setup next-N features - pure address arithmetic, no page content.
      * offset/offset_from_faulting match training's check_spatial(), which
      * uses a constant offset=-1 (no real per-candidate pointer location
@@ -130,7 +165,7 @@ void page_prefetch_spatial(fault_t *f, int chan_id)
         features[i].delta = i + 1;
         features[i].offset_from_faulting = -1 - faulting_location;
         features[i].prev_pc = f->prev_pc;
-        features[i].prev_delta = (float) f->prev_delta / CHUNK_SIZE;
+        features[i].prev_delta = (double)(f->prev_delta / (int64_t)CHUNK_SIZE);
     }
 
     pass_start_tsc = rdtsc();
@@ -152,6 +187,8 @@ void page_prefetch_spatial(fault_t *f, int chan_id)
         if (responses[k] == 1)
             RSTAT(PREFETCH_SPATIAL_CANDIDATES_POSITIVE)++;
     RSTAT(PREFETCH_SPATIAL_INFER_CYCLES) += rdtsc() - pass_start_tsc;
+
+#endif
 
     pass_start_tsc = rdtsc();
     int nprefetches = prefetch_act(f, chan_id, ptr_val, responses, ncandidates);
@@ -188,6 +225,49 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
     int ncandidates = 0;
 
     assert(f->page);
+    /* no pointer model for this PC: skip scanning and gating its 512 slots,
+     * every candidate would be predicted "don't prefetch" anyway */
+    if (!prefetch_pc_has_model_pointer(f->pc)) {
+        RSTAT(PREFETCH_NO_MODEL_SKIPS)++;
+        return 0;
+    }
+#ifdef DO_PREFETCH_SINGLE_TREE
+    /*
+     * PySTreeD builds: predict first, then gate only the positives. The
+     * tree's fault-level conditions (PC, prev_pc, prev_delta) are resolved
+     * once, its Offset/Offset_from_faulting ranges narrow the 512 slots to
+     * the few that could be positive, and only those are read and scored
+     * (see single_tree_pointer_candidates()). is_page_prefetchable() - the
+     * expensive part (page-flag lookup + lock) - then runs on predicted
+     * positives only, instead of on every nonzero slot. Same prefetches as
+     * gating everything first; a positive that fails the gate is dropped.
+     */
+    (void)features;
+    (void)responses;
+    {
+        uint64_t positive_pages[512];
+        int nread;
+        unsigned long pass_start_tsc = rdtsc();
+        int npositive = single_tree_pointer_candidates(f->pc, f->prev_pc,
+            (double)(f->prev_delta / (int64_t)CHUNK_SIZE), faulting_location,
+            (const uint64_t *)f->page, f->page, positive_pages, &nread);
+        RSTAT(PREFETCH_INFER_CYCLES) += rdtsc() - pass_start_tsc;
+        RSTAT(PREFETCH_SLOTS_READ) += nread;
+        RSTAT(PREFETCH_CANDIDATES_POSITIVE) += npositive;
+
+        pass_start_tsc = rdtsc();
+        for (int k = 0; k < npositive; k++) {
+            if (is_page_prefetchable(f, positive_pages[k])) {
+                compact_ptr_val[ncandidates] = positive_pages[k];
+                compact_responses[ncandidates] = 1;
+                ncandidates++;
+            }
+        }
+        RSTAT(PREFETCH_GATE_CYCLES) += rdtsc() - pass_start_tsc;
+        RSTAT(PREFETCH_CANDIDATES_GATED) += ncandidates;
+    }
+    (void)compact_features;
+#else
     /* Setup pointer features. delta can't be filled in here yet (would be
      * (*ptr - f->page) / CHUNK_SIZE) - it needs the real pointer value off
      * the faulted page, which Pass 1 below reads anyway to compute ptr_val
@@ -203,7 +283,7 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
         feature->offset = i;
         feature->offset_from_faulting = i - faulting_location;
         feature->prev_pc = f->prev_pc;
-        feature->prev_delta = (float) f->prev_delta / CHUNK_SIZE;
+        feature->prev_delta = (double)(f->prev_delta / (int64_t)CHUNK_SIZE);
         responses[i] = 0;
     }
 
@@ -222,7 +302,7 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
         uint64_t ptr_val = *((uint64_t *) f->page + i);
         ptr_val = ptr_val & ~CHUNK_MASK;
         if (is_page_prefetchable(f, ptr_val)) {
-            features[i].delta = (float)((int64_t)ptr_val - (int64_t)f->page) / CHUNK_SIZE;
+            features[i].delta = (double)(((int64_t)ptr_val - (int64_t)f->page) / (int64_t)CHUNK_SIZE);
             compact_features[ncandidates] = features[i];
             compact_ptr_val[ncandidates] = ptr_val;
             ncandidates++;
@@ -244,12 +324,14 @@ unsigned long page_postfetch(fault_t * f, FeatureVector *features,
             RSTAT(PREFETCH_CANDIDATES_POSITIVE)++;
     RSTAT(PREFETCH_INFER_CYCLES) += rdtsc() - pass_start_tsc;
 
+#endif
+
     /*
      * Pass 3: act on results.
      */
-    pass_start_tsc = rdtsc();
+    unsigned long act_start_tsc = rdtsc();
     int nprefetches = prefetch_act(f, chan_id, compact_ptr_val, compact_responses, ncandidates);
-    RSTAT(PREFETCH_ACT_CYCLES) += rdtsc() - pass_start_tsc;
+    RSTAT(PREFETCH_ACT_CYCLES) += rdtsc() - act_start_tsc;
 
     /*
      * book memory pressure for the prefetch reads we just posted and

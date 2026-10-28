@@ -177,6 +177,13 @@ int parse_env_settings()
     if (parse_numeric_env_setting("FLTRACE_MAX_SAMPLES_PER_SEC", &val) == 0)
         samples_per_sec = val;
 
+#ifdef DO_IDEAL_PREFETCH_SIM
+    /* idealized-prefetcher simulation delay (microseconds, 0 = disabled) -
+     * see ideal_prefetch_delay_us's comment in common.h */
+    if (parse_numeric_env_setting("FLTRACE_IDEAL_PREFETCH_DELAY_US", &val) == 0)
+        ideal_prefetch_delay_us = val;
+#endif
+
     return 0;
 }
 

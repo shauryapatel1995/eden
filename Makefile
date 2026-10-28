@@ -216,6 +216,34 @@ XGBOOST_LINK_FLAGS = -Wl,--whole-archive $(XGBOOST_LIBS) -Wl,--no-whole-archive 
 endif
 endif
 
+# per-PC single-tree native prefetcher (opt-in: make fltrace.so DO_PREFETCH=1
+# NATIVE_ONLY=1 DO_PREFETCH_SINGLE_TREE=1). Swaps native_predict_{spatial,
+# pointer}.c's shared XGBoost-ensemble trees for single_tree_predict_{spatial,
+# pointer}.c's one-tiny-tree-per-PC approach (see
+# tools/fltrace/single_tree_codegen/README.md) - mutually exclusive with the
+# ensemble path, enforced by native_predict_{spatial,pointer}.c's own
+# DO_PREFETCH_SINGLE_TREE-excluding guard (both files define the same
+# native_predict_batch_{spatial,pointer}() symbols, so having both compile
+# their bodies in at once would be a duplicate-symbol link error). Still
+# requires NATIVE_ONLY=1 (and thus DO_PREFETCH=1) since xgboost_prefetcher.c's
+# NATIVE_ONLY branch is what calls into native_predict_batch_{spatial,
+# pointer}() at all, regardless of which .c file provides them.
+ifneq ($(DO_PREFETCH_SINGLE_TREE),)
+CFLAGS += -DDO_PREFETCH_SINGLE_TREE
+endif
+
+# Leap prefetcher baseline (opt-in: make fltrace.so DO_PREFETCH_LEAP=1).
+# Address-only majority-stride prefetcher ported from DiLOS (see
+# rmem/prefetch_leap.c), for comparison against the learned prefetchers.
+# Needs no model or libxgboost. Mutually exclusive with DO_PREFETCH, since
+# both prefetch from the same point in handle_page_fault().
+ifneq ($(DO_PREFETCH_LEAP),)
+ifneq ($(DO_PREFETCH),)
+$(error DO_PREFETCH_LEAP and DO_PREFETCH are mutually exclusive)
+endif
+CFLAGS += -DDO_PREFETCH_LEAP
+endif
+
 # raw pc/pointer-content tracing for collecting prefetcher training data
 # (opt-in: make fltrace.so DO_TRACING=1). dumps one line per fault with its
 # page address, faulting address and pc, plus one line per nonzero pointer
@@ -228,9 +256,22 @@ endif
 # (opt-in: make fltrace.so DO_FAULT_TIMING=1). Prints one line per call in
 # microseconds for the first FAULT_TIMING_LIMIT calls, for reading raw
 # per-fault numbers directly instead of inferring from rdtsc()/assumed
-# cycles-per-us - see rmem/handler.c.
+# cycles-per-us - see rmem/fault.c.
 ifneq ($(DO_FAULT_TIMING),)
 CFLAGS += -DDO_FAULT_TIMING
+endif
+
+# idealized-prefetcher simulation (opt-in: make fltrace.so
+# DO_IDEAL_PREFETCH_SIM=1). LOCAL-backend only - injects an artificial
+# per-completion delay (FLTRACE_IDEAL_PREFETCH_DELAY_US env var,
+# microseconds) on exactly 1 in every 8 real-fault reads, leaving the other
+# 7 free - simulating a perfect prefetcher that always correctly prefetches
+# 7 of every 8 pages ahead of need, paying only the cost of the page it
+# didn't get to in time. Used to find the RDMA-latency threshold beyond
+# which even an ideal prefetcher can't beat a no-prefetch baseline - see
+# rmem/rmem_local.c's local_post_read()/local_check_cq().
+ifneq ($(DO_IDEAL_PREFETCH_SIM),)
+CFLAGS += -DDO_IDEAL_PREFETCH_SIM
 endif
 
 # RDMA backend support (opt-in: make fltrace.so RDMA=1). Needed to select

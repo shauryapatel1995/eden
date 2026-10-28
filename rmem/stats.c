@@ -29,6 +29,14 @@ const char *rstat_names[] = {
     "prefetch_spatial_prefetches",
     "prefetch_backend_busy",
     "prefetch_skipped_stop_early",
+    "prefetch_no_model_skips",
+    "prefetch_spatial_no_model_skips",
+    "prefetch_zero_page_skips",
+    "prefetch_slots_read",
+    "leap_prefetches",
+    "leap_hits",
+    "leap_trend_found",
+    "leap_no_trend",
 
     /* eviction stats */
     "evict_ops",
@@ -70,6 +78,8 @@ const char *rstat_names[] = {
 	"prefetch_spatial_gate_cycles",
 	"prefetch_spatial_infer_cycles",
 	"prefetch_spatial_act_cycles",
+	"leap_decide_cycles",
+	"leap_act_cycles",
 	"handle_fault_cycles",
 
 	/* rmem hints */

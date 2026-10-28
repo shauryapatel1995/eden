@@ -133,7 +133,10 @@ BUILD_ASSERT(EVICTION_MAX_BATCH_SIZE <= RMEM_MAX_CHUNKS_PER_OP);
  * completely full, as a backstop against unbounded growth if insertions
  * outpace both natural draining and this age threshold. */
 #define PREFETCH_STAGING_MAX_PAGES     2048
+#ifndef PREFETCH_STAGING_MIN_FAULT_AGE  /* overridable at build time, e.g.
+                                        * PROVIDED_CFLAGS=-DPREFETCH_STAGING_MIN_FAULT_AGE=2048 */
 #define PREFETCH_STAGING_MIN_FAULT_AGE 250
+#endif
 
 /* eviction policy (default is none) */
 // #define SC_EVICTION     /* second-chance eviction */

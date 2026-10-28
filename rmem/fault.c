@@ -341,6 +341,7 @@ static inline void fault_serve_zero_pages(fault_t* f, int nchunks)
     /* done */
     log_debug("%s - added %d zero pages", FSTR(f), nchunks);
     RSTAT(FAULTS_ZP)++;
+    f->zero_page = 1;
 }
 
 /* Called after a prefetched page is read from the backend. Takes mr/prio
@@ -435,15 +436,24 @@ void fault_done(fault_t* f, int chan_id, int *nevicts_needed)
     unsigned long postfetch_start_tsc;
 #endif
 
-#ifdef DO_PREFETCH
+#if defined(DO_PREFETCH) || defined(DO_PREFETCH_LEAP)
     /* bump once per real fault serviced, before this fault's own prefetches
      * (if any) get staged - see prefetch_fault_counter in common.h */
     atomic64_add_and_fetch(&prefetch_fault_counter, 1);
+#endif
 
+#ifdef DO_PREFETCH
     /* speculatively prefetch pointer-chase candidates off the page we just
      * finished servicing, before releasing its lock. this runs on the
      * single handler thread, which can't poll for the next real uffd
      * fault while it's in here - see RSTAT_PREFETCH_SCAN_CYCLES */
+    /* a first-touch fault was just served an all-zero page: there are no
+     * pointers on it to chase (and the tracing build dumps no candidates
+     * for such pages either, so the models never saw them) */
+    if (f->zero_page) {
+        RSTAT(PREFETCH_ZERO_PAGE_SKIPS)++;
+        goto postfetch_done;
+    }
     postfetch_start_tsc = rdtsc();
 #ifdef DO_FAULT_TIMING
     struct timespec __pf_ts1, __pf_ts2;
@@ -462,6 +472,7 @@ void fault_done(fault_t* f, int chan_id, int *nevicts_needed)
     }
 #endif
     RSTAT(PREFETCH_SCAN_CYCLES) += rdtsc() - postfetch_start_tsc;
+postfetch_done: ;
 #endif
 
 #ifdef DO_TRACING
@@ -745,6 +756,10 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
              * this fault before fault_done() runs, so accessing it here is
              * safe; see page_prefetch_spatial() in prefetch.c) */
             page_prefetch_spatial(fault, chan_id);
+#endif
+#ifdef DO_PREFETCH_LEAP
+            /* Leap baseline: address-only, so it runs at the same point */
+            page_prefetch_leap(fault, chan_id);
 #endif
 
             status = FAULT_READ_POSTED;
