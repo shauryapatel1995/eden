@@ -18,7 +18,10 @@ import matplotlib.pyplot as plt
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CSV = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "results_all.csv")
-WORKLOADS = ["redis", "memcached", "wiredtiger", "webservice", "dataframe", "neo4j"]
+WORKLOADS = ["redis", "memcached", "wiredtiger", "webservice", "dataframe", "neo4j",
+             "mcf", "cactu", "xalan"]
+# SPEC trees are trained and tested on the same input for now (refrate runs pending)
+SAME_INPUT = {"mcf", "cactu", "xalan"}
 CONFIGS = ["default", "n4_c1", "n4_c0", "n32_c1", "n32_c0"]
 LABELS = {"default": "Linux default", "n4_c1": "Trees N=4, claim",
           "n4_c0": "Trees N=4, no claim", "n32_c1": "Trees N=32, claim",
@@ -43,7 +46,8 @@ def stat(vals):
 
 def xlabel(wl):
     n = len(rows[wl, "default"])
-    return wl if n > 1 else f"{wl}\n(1 run)"
+    s = wl if n > 1 else f"{wl}\n(1 run)"
+    return s + "\n(train=test)" if wl in SAME_INPUT else s
 
 def style(ax):
     for s in ("top", "right"):
@@ -58,7 +62,7 @@ plt.rcParams.update({"font.size": 10, "text.color": INK, "axes.labelcolor": INK}
 EB = dict(ecolor=INK, elinewidth=1, capsize=2)
 
 # ---- figure 1: major faults and prefetched pages vs no prefetching ----
-fig, ax = plt.subplots(figsize=(14, 5))
+fig, ax = plt.subplots(figsize=(20, 5.5))
 w, gap = 0.08, 0.04
 for i, wl in enumerate(WORKLOADS):
     base = np.median([float(r["majflt"]) for r in rows[wl, "noprefetch"]])
@@ -70,7 +74,7 @@ for i, wl in enumerate(WORKLOADS):
                    hatch="////" if j else None, fill=not j, lw=1.2,
                    yerr=np.array([err]).T, error_kw=EB)
 ax.axhline(1, color=INK2, lw=1, ls="--")
-ax.text(len(WORKLOADS) - 0.45, 1.02, "no prefetching", color=INK2, ha="right", va="bottom", fontsize=9)
+ax.text(-0.45, 1.02, "no prefetching", color=INK2, ha="left", va="bottom", fontsize=9)
 ax.set_xticks(range(len(WORKLOADS)), [xlabel(wl) for wl in WORKLOADS])
 ax.set_ylabel("Pages / no-prefetch major faults")
 ax.set_title("Major faults (solid) and prefetched pages (hatched), normalised to no prefetching",
@@ -85,7 +89,7 @@ fig.tight_layout()
 fig.savefig(os.path.join(HERE, "fig_faults_prefetches.png"), dpi=200)
 
 # ---- figure 2: performance normalised to Linux default, >1 = better ----
-fig, ax = plt.subplots(figsize=(12, 4.5))
+fig, ax = plt.subplots(figsize=(16, 5))
 w = 0.15
 for i, wl in enumerate(WORKLOADS):
     base = np.median([float(r["metric"]) for r in rows[wl, "default"]])
