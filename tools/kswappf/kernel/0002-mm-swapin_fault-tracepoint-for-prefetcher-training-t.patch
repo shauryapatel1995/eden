@@ -1,0 +1,114 @@
+From ef07a82ebc75cb798d4157c2c5d08116237c8fce Mon Sep 17 00:00:00 2001
+From: Shaurya Patel <spatel27@cs.ubc.ca>
+Date: Tue, 27 Oct 2026 12:06:40 -0700
+Subject: [PATCH 2/2] mm: swapin_fault tracepoint for prefetcher training
+ traces
+
+One event per fault on a swapped-out page, recorded in do_swap_page() right
+after the swap-cache lookup and before the synchronous-device fast path, so
+every swap-in fault is seen whatever the swap device (zram, brd, pmem and
+block devices alike). Fields: exact faulting address, user-space PC (for a
+fault inside a system call, the syscall's call site), tgid, and whether the
+page was still in the swap cache. Off unless enabled through tracefs.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ include/trace/events/swapin.h | 47 +++++++++++++++++++++++++++++++++++
+ mm/memory.c                   |  5 ++++
+ mm/swap_state.c               |  3 +++
+ 3 files changed, 55 insertions(+)
+ create mode 100644 include/trace/events/swapin.h
+
+diff --git a/include/trace/events/swapin.h b/include/trace/events/swapin.h
+new file mode 100644
+index 000000000..082bec9ae
+--- /dev/null
++++ b/include/trace/events/swapin.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM swapin
++
++#if !defined(_TRACE_SWAPIN_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_SWAPIN_H
++
++#include <linux/tracepoint.h>
++#include <linux/sched.h>
++
++/*
++ * One event per fault on a swapped-out page (do_swap_page()), recorded
++ * before the swap-cache / synchronous-device paths split, so every swap-in
++ * fault is seen whatever the swap device. Used to collect prefetcher
++ * training traces: enable with
++ *   echo 1 > /sys/kernel/tracing/events/swapin/swapin_fault/enable
++ * and restrict to one process with
++ *   echo 'tgid == <pid>' > /sys/kernel/tracing/events/swapin/swapin_fault/filter
++ */
++TRACE_EVENT(swapin_fault,
++
++	TP_PROTO(unsigned long address, unsigned long ip, bool in_swap_cache),
++
++	TP_ARGS(address, ip, in_swap_cache),
++
++	TP_STRUCT__entry(
++		__field(unsigned long,	address)	/* exact faulting address */
++		__field(unsigned long,	ip)		/* user-space PC */
++		__field(int,		tgid)
++		__field(bool,		in_swap_cache)	/* found in the swap cache: no device read */
++	),
++
++	TP_fast_assign(
++		__entry->address	= address;
++		__entry->ip		= ip;
++		__entry->tgid		= current->tgid;
++		__entry->in_swap_cache	= in_swap_cache;
++	),
++
++	TP_printk("tgid=%d addr=%lx ip=%lx cached=%d",
++		  __entry->tgid, __entry->address, __entry->ip,
++		  __entry->in_swap_cache)
++);
++
++#endif /* _TRACE_SWAPIN_H */
++
++#include <trace/define_trace.h>
+diff --git a/mm/memory.c b/mm/memory.c
+index a64919cf0..eab496289 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -80,6 +80,7 @@
+ #include <linux/sched/sysctl.h>
+ 
+ #include <trace/events/kmem.h>
++#include <trace/events/swapin.h>
+ 
+ #include <asm/io.h>
+ #include <asm/mmu_context.h>
+@@ -3808,6 +3809,10 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	if (folio)
+ 		page = folio_file_page(folio, swp_offset(entry));
+ 	swapcache = folio;
++	/* user-space PC: for a fault raised inside a system call (e.g. a
++	 * copy_to_user()), the syscall's call site rather than a kernel PC */
++	trace_swapin_fault(vmf->real_address,
++			   instruction_pointer(task_pt_regs(current)), !!folio);
+ 
+ 	if (!folio) {
+ 		if (data_race(si->flags & SWP_SYNCHRONOUS_IO) &&
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index a64ec2d5a..f1f6adb66 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -22,6 +22,9 @@
+ #include <linux/huge_mm.h>
+ #include <linux/shmem_fs.h>
+ #include <linux/swap_prefetch.h>
++
++#define CREATE_TRACE_POINTS
++#include <trace/events/swapin.h>
+ #include "internal.h"
+ #include "swap.h"
+ 
+-- 
+2.34.1
+
