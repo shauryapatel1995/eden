@@ -20,8 +20,6 @@
  *                2 = read only the faulting page (no-prefetch baseline)
  *   target_tgid  the process to act on; every other process gets the
  *                kernel's own read-ahead
- *   next_n       mode 1: pages +1..+next_n asked of the trees (default 4;
- *                set it to the PF_SPATIAL_N the trees were trained with)
  * Counters (read-only): faults, model_faults, predicted_pages.
  */
 #include <linux/module.h>
@@ -48,10 +46,6 @@ static int target_tgid;
 module_param(target_tgid, int, 0644);
 MODULE_PARM_DESC(target_tgid, "process (tgid) to act on");
 
-static int next_n = 4;
-module_param(next_n, int, 0644);
-MODULE_PARM_DESC(next_n, "mode 1: deltas +1..+next_n asked of the trees (1..64; match the training window)");
-
 static atomic64_t faults = ATOMIC64_INIT(0);		/* target swap-in faults seen */
 static atomic64_t model_faults = ATOMIC64_INIT(0);	/* ... whose PC has a tree */
 static atomic64_t predicted_pages = ATOMIC64_INIT(0);	/* pages asked for */
@@ -76,7 +70,7 @@ static bool eden_predict(struct vm_fault *vmf, struct swap_prefetch_req *req)
 {
 	unsigned long pc, page, prev_pc;
 	long prev_delta;
-	int fl, k, n, m = mode;
+	int fl, k, m = mode;
 	st_model_t model;
 	uint32_t active;
 
@@ -109,8 +103,7 @@ static bool eden_predict(struct vm_fault *vmf, struct swap_prefetch_req *req)
 		return true;			/* no tree: just the faulting page */
 	atomic64_inc(&model_faults);
 	active = model.fault(pc, prev_pc, prev_delta);
-	n = clamp(READ_ONCE(next_n), 1, 64);
-	for (k = 1; active && k <= n; k++)
+	for (k = 1; active && k <= 4; k++)
 		if (st_predict(&model, active, -1, -1 - fl, k))
 			req->fwd |= 1ULL << (k - 1);
 	atomic64_add(hweight64(req->fwd), &predicted_pages);
