@@ -19,13 +19,11 @@ import matplotlib.pyplot as plt
 HERE = os.path.dirname(os.path.abspath(__file__))
 CSV = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "results_all.csv")
 WORKLOADS = ["redis", "memcached", "wiredtiger", "webservice", "dataframe", "neo4j",
-             "mcf", "cactu", "xalan"]
-# SPEC trees are trained and tested on the same input for now (refrate runs pending)
-SAME_INPUT = {"mcf", "cactu", "xalan"}
-CONFIGS = ["default", "n4_c1", "n4_c0", "n32_c1", "n32_c0"]
-LABELS = {"default": "Linux default", "n4_c1": "Trees N=4, claim",
-          "n4_c0": "Trees N=4, no claim", "n32_c1": "Trees N=32, claim",
-          "n32_c0": "Trees N=32, no claim"}
+             "mcf_ref", "cactu_ref", "xalan_ref"]
+# SPEC: refrate input, trees trained on the train input only
+SAME_INPUT = set()
+CONFIGS = ["default", "n4_c0", "n32_c0"]   # claim-rule (c1) trees dropped
+LABELS = {"default": "Linux default", "n4_c0": "Trees N=4", "n32_c0": "Trees N=32"}
 COLORS = {"default": "#52514e", "n4_c1": "#2a78d6", "n4_c0": "#1baf7a",
           "n32_c1": "#eb6834", "n32_c0": "#6250d6"}
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
@@ -46,7 +44,7 @@ def stat(vals):
 
 def xlabel(wl):
     n = len(rows[wl, "default"])
-    s = wl if n > 1 else f"{wl}\n(1 run)"
+    s = wl.replace("_ref", "\n(refrate)") if n > 1 else f"{wl}\n(1 run)"
     return s + "\n(train=test)" if wl in SAME_INPUT else s
 
 def style(ax):
@@ -62,8 +60,8 @@ plt.rcParams.update({"font.size": 10, "text.color": INK, "axes.labelcolor": INK}
 EB = dict(ecolor=INK, elinewidth=1, capsize=2)
 
 # ---- figure 1: major faults and prefetched pages vs no prefetching ----
-fig, ax = plt.subplots(figsize=(20, 5.5))
-w, gap = 0.08, 0.04
+fig, ax = plt.subplots(figsize=(16, 5.5))
+w, gap = 0.12, 0.06
 for i, wl in enumerate(WORKLOADS):
     base = np.median([float(r["majflt"]) for r in rows[wl, "noprefetch"]])
     for j, kind in enumerate(("majflt", "prefetched_pages")):
@@ -84,13 +82,13 @@ handles = [plt.Rectangle((0, 0), 1, 1, color=COLORS[c]) for c in CONFIGS]
 handles += [plt.Rectangle((0, 0), 1, 1, fc=INK2, ec=INK2),
             plt.Rectangle((0, 0), 1, 1, fill=False, ec=INK2, hatch="////")]
 ax.legend(handles, [LABELS[c] for c in CONFIGS] + ["major faults", "prefetched pages"],
-          ncol=7, frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.12), fontsize=9)
+          ncol=5, frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.12), fontsize=9)
 fig.tight_layout()
 fig.savefig(os.path.join(HERE, "fig_faults_prefetches.png"), dpi=200)
 
 # ---- figure 2: performance normalised to no prefetching, >1 = better ----
-fig, ax = plt.subplots(figsize=(16, 5))
-w = 0.15
+fig, ax = plt.subplots(figsize=(14, 5))
+w = 0.22
 for i, wl in enumerate(WORKLOADS):
     base = np.median([float(r["metric"]) for r in rows[wl, "noprefetch"]])
     lower = rows[wl, "noprefetch"][0]["better"] == "lower"
@@ -109,7 +107,7 @@ ax.set_title("End-to-end performance normalised to no prefetching", loc="left", 
 style(ax)
 ax.legend([plt.Rectangle((0, 0), 1, 1, color=COLORS[c]) for c in CONFIGS]
           + [plt.Line2D([0], [0], color=INK2, lw=1, ls="--")],
-          [LABELS[c] for c in CONFIGS] + ["no prefetching (= 1)"], ncol=6, frameon=False, loc="upper center",
+          [LABELS[c] for c in CONFIGS] + ["no prefetching (= 1)"], ncol=4, frameon=False, loc="upper center",
           bbox_to_anchor=(0.5, -0.2), fontsize=9)
 fig.tight_layout()
 fig.savefig(os.path.join(HERE, "fig_performance.png"), dpi=200)
