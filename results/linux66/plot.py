@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 HERE = os.path.dirname(os.path.abspath(__file__))
 CSV = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "results_all.csv")
 WORKLOADS = ["redis", "memcached", "wiredtiger", "webservice", "dataframe", "neo4j",
-             "mcf_ref", "cactu_ref", "xalan_ref"]
+             "mcf_ref", "cactu_ref", "xalan_ref", "xgb_py"]
 # SPEC: refrate input, trees trained on the train input only
 SAME_INPUT = set()
 CONFIGS = ["default", "n4_c0", "n32_c0"]   # claim-rule (c1) trees dropped
