@@ -6,8 +6,8 @@ fig_faults_prefetches.png: major faults and prefetched pages per config, both
 fig_performance.png: end-to-end performance normalised to no prefetching,
     oriented so >1 is better (noprefetch/config for times, config/noprefetch for rates).
 
-Bars are the median over rounds; error bars span the 2nd..4th of the 5 sorted
-rounds (inter-quartile); workloads with one round have no error bar.
+Bars are the median over rounds (5, or 3 for wt_c/gap_*/lbm_ref/memtier); error bars
+span the 25th..75th percentile of the rounds; workloads with one round have no error bar.
 """
 import csv, os, sys
 from collections import defaultdict
@@ -19,7 +19,11 @@ import matplotlib.pyplot as plt
 HERE = os.path.dirname(os.path.abspath(__file__))
 CSV = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "results_all.csv")
 WORKLOADS = ["redis", "memcached", "wiredtiger", "webservice", "dataframe", "neo4j",
-             "mcf_ref", "cactu_ref", "xalan_ref", "xgb_py"]
+             "mcf_ref", "cactu_ref", "xalan_ref", "xgb_py",
+             "wt_c", "gap_pr", "gap_sssp", "lbm_ref", "memtier"]
+# workloads whose x label differs from the name; all of these test on different data than they trained on
+NAMES = {"wt_c": "wiredtiger\n(YCSB-C)", "gap_pr": "GAP PR\n(LJ->Twitter)",
+         "gap_sssp": "GAP SSSP\n(LJ->Twitter)", "memtier": "redis\n(memtier)"}
 # SPEC: refrate input, trees trained on the train input only
 SAME_INPUT = set()
 CONFIGS = ["default", "n4_c0", "n32_c0"]   # claim-rule (c1) trees dropped
@@ -44,7 +48,7 @@ def stat(vals):
 
 def xlabel(wl):
     n = len(rows[wl, "default"])
-    s = wl.replace("_ref", "\n(refrate)") if n > 1 else f"{wl}\n(1 run)"
+    s = NAMES.get(wl, wl).replace("_ref", "\n(refrate)") if n > 1 else f"{wl}\n(1 run)"
     return s + "\n(train=test)" if wl in SAME_INPUT else s
 
 def style(ax):
@@ -60,7 +64,7 @@ plt.rcParams.update({"font.size": 10, "text.color": INK, "axes.labelcolor": INK}
 EB = dict(ecolor=INK, elinewidth=1, capsize=2)
 
 # ---- figure 1: major faults and prefetched pages vs no prefetching ----
-fig, ax = plt.subplots(figsize=(16, 5.5))
+fig, ax = plt.subplots(figsize=(22, 5.5))
 w, gap = 0.12, 0.06
 for i, wl in enumerate(WORKLOADS):
     base = np.median([float(r["majflt"]) for r in rows[wl, "noprefetch"]])
@@ -87,7 +91,7 @@ fig.tight_layout()
 fig.savefig(os.path.join(HERE, "fig_faults_prefetches.png"), dpi=200)
 
 # ---- figure 2: performance normalised to no prefetching, >1 = better ----
-fig, ax = plt.subplots(figsize=(14, 5))
+fig, ax = plt.subplots(figsize=(20, 5))
 w = 0.22
 for i, wl in enumerate(WORKLOADS):
     base = np.median([float(r["metric"]) for r in rows[wl, "noprefetch"]])
