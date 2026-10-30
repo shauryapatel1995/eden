@@ -4,7 +4,7 @@ Claim-0 PySTreeD spatial trees (depth 3, F0.5), one tree set per workload and wi
 
 - **Size**: lines of the generated `native_tree_model_spatial.h` (non-blank, non-comment) and the `.text` size of the built `eden_swappf_n<N>_c0.ko`.
   Shared code on top of every tree set: `tools/kswappf/eden_swappf.c` (108 lines) and the kernel part of `tools/fltrace/native_tree_eval.h` (28 lines).
-- **Latency**: one `eden_predict()` call (history update, per-PC tree lookup, fault-level mask, then `st_predict()` for k = 1..N),
+- **Latency**: per page fault, covering all N candidates: one `eden_predict()` call (history update, per-PC tree lookup, fault-level mask, then `st_predict()` for k = 1..N),
   compiled `gcc -O2` in user space from the same headers, replaying the first 10k faults of the workload's training trace on one pinned core.
   Timed per call with `rdtsc`; the median empty-timer overhead (~20 ns) is subtracted. Includes faults whose PC has no tree.
   For scale: an SSD swap-in major fault on this machine costs 22-29 us.
@@ -42,3 +42,4 @@ Claim-0 PySTreeD spatial trees (depth 3, F0.5), one tree set per workload and wi
 | memtier | 4 | 1 | 1 | 7 | 46 | 3471 | 87.0 | 12.9 | 13.8 | 28.3 |
 | memtier | 32 | 3 | 5 | 29 | 94 | 4250 | 97.8 | 58.1 | 65.0 | 105.1 |
 | etc | 4 | 13 | 16 | 95 | 499 | 10689 | 99.0 | 25.2 | 22.8 | 54.6 |
+| etc | 32 | 23 | 24 | 163 | 720 | 13059 | 99.8 | 79.1 | 85.7 | 136.9 |
