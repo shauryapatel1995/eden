@@ -181,7 +181,135 @@ static void stack_scan(unsigned long pc)
         clear_page_flags(mr, page, PFLAG_WORK_ONGOING, &oldflags);
     }
 }
+
+/* Stack-anchor tracing (FLTRACE_STACK_ANCHORS=1, tracing build only, needs
+ * the 5.16.0-uffdsp+ kernel's SP in uffd_msg): which stack words point at
+ * an object that holds a pointer into the faulting page? Right after the
+ * fault's "PF addr" line, for every stack word w (offset soff words above
+ * SP) whose target page is present in a uffd region and which has a slot
+ * within +-64 bytes of the target (same page) whose value falls on the
+ * faulting page:
+ *   "Stk: soff, stack_addr, target, rel"   rel = matching slot - target, bytes
+ * one line per matching (word, slot); then, once per distinct target page,
+ * that page's pointer contents (slots pointing into any uffd region, present
+ * or not, so links to resident objects are kept too):
+ *   "StkPg: page, idx, val: v, present:p"  idx = 8-byte slot index in page
+ * Separate lines rather than extra PF-line fields because DataClasses.Trace
+ * parses the PF line from its end; tags avoid "Loc:", which
+ * process_linux_trace.py substring-matches for faulting-page pointers. */
+#define SA_MAX_WORDS    1024        /* scan at most 8KB above SP */
+#define SA_REL_BYTES    64
+#define SA_MAX_PAGES    64
+#define SA_NRANGES      16
+static int sa_enabled = -1;
+static struct { unsigned long lo, hi; } sa_ranges[SA_NRANGES];
+static int sa_nranges;
+
+/* end of the (non-uffd) mapping holding the stack at sp, from a small cache
+ * of mappings refreshed from /proc/self/maps on a miss (new thread stacks);
+ * 0 if none */
+static unsigned long sa_stack_end(unsigned long sp)
+{
+    char line[512];
+    unsigned long lo, hi;
+    FILE *maps;
+    int i;
+
+    for (i = 0; i < sa_nranges; i++)
+        if (sa_ranges[i].lo <= sp && sp < sa_ranges[i].hi)
+            return sa_ranges[i].hi;
+    if (get_region_by_addr_unsafe(sp & ~CHUNK_MASK))
+        return 0;   /* stack in uffd memory: reading it could self-fault */
+    maps = fopen("/proc/self/maps", "r");
+    while (maps && fgets(line, sizeof(line), maps)) {
+        if (sscanf(line, "%lx-%lx", &lo, &hi) == 2 && lo <= sp && sp < hi) {
+            i = sa_nranges < SA_NRANGES ? sa_nranges++ : sp % SA_NRANGES;
+            sa_ranges[i].lo = lo;
+            sa_ranges[i].hi = hi;
+            fclose(maps);
+            return hi;
+        }
+    }
+    if (maps)
+        fclose(maps);
+    return 0;
+}
+
+/* lock a present uffd page for reading from the handler thread (eviction
+ * respects PFLAG_WORK_ONGOING); false if absent or someone holds it */
+static bool sa_lock_present(struct region_t *mr, unsigned long page)
+{
+    pgflags_t flags, oldflags;
+
+    flags = get_page_flags(mr, page);
+    if (!(flags & PFLAG_PRESENT) || (flags & PFLAG_WORK_ONGOING))
+        return false;
+    flags = set_page_flags(mr, page, PFLAG_WORK_ONGOING, &oldflags);
+    if (oldflags & PFLAG_WORK_ONGOING)
+        return false;
+    if (!(flags & PFLAG_PRESENT)) {
+        clear_page_flags(mr, page, PFLAG_WORK_ONGOING, &oldflags);
+        return false;
+    }
+    return true;
+}
+
+static void stack_anchors(unsigned long sp, unsigned long fault_page)
+{
+    unsigned long end, val, page, dumped[SA_MAX_PAGES];
+    unsigned long *stack = (unsigned long *) sp, *slot, *p;
+    int nwords, ndumped = 0, soff, j, k, rel;
+    struct region_t *mr, *vmr;
+    pgflags_t oldflags;
+    bool matched;
+
+    if (sa_enabled < 0)
+        sa_enabled = getenv("FLTRACE_STACK_ANCHORS") && atoi(getenv("FLTRACE_STACK_ANCHORS"));
+    if (!sa_enabled || !sp || !(end = sa_stack_end(sp)))
+        return;
+    nwords = (end - sp) / 8;
+    if (nwords > SA_MAX_WORDS)
+        nwords = SA_MAX_WORDS;
+
+    for (soff = 0; soff < nwords; soff++) {
+        val = stack[soff];
+        page = val & ~CHUNK_MASK;
+        if (!(mr = get_region_by_addr_unsafe(page)))
+            continue;
+        if (!sa_lock_present(mr, page))
+            continue;
+        /* slots within +-64 bytes of the target, clipped to its page */
+        slot = (unsigned long *) (val & ~7UL);
+        matched = false;
+        for (rel = -SA_REL_BYTES; rel <= SA_REL_BYTES; rel += 8) {
+            p = (unsigned long *) ((unsigned long) slot + rel);
+            if ((unsigned long) p < page || (unsigned long) p >= page + CHUNK_SIZE)
+                continue;
+            if ((*p & ~CHUNK_MASK) == fault_page) {
+                fprintf(stderr, "Stk: %d, %lx, %lx, %d\n", soff,
+                    sp + soff * 8, val, rel);
+                matched = true;
+            }
+        }
+        if (matched) {
+            for (k = 0; k < ndumped && dumped[k] != page; k++)
+                ;
+            if (k == ndumped && ndumped < SA_MAX_PAGES) {
+                dumped[ndumped++] = page;
+                p = (unsigned long *) page;
+                for (j = 0; j < CHUNK_SIZE / 8; j++) {
+                    if (!p[j] || !(vmr = get_region_by_addr_unsafe(p[j] & ~CHUNK_MASK)))
+                        continue;
+                    fprintf(stderr, "StkPg: %lx, %d, val: %lx, present:%d\n", page, j,
+                        p[j], !!(get_page_flags(vmr, p[j] & ~CHUNK_MASK) & PFLAG_PRESENT));
+                }
+            }
+        }
+        clear_page_flags(mr, page, PFLAG_WORK_ONGOING, &oldflags);
+    }
+}
 #endif
+
 
 /* check if a fault already exists in the wait queue */
 bool does_fault_exist_in_wait_q(struct fault *fault)
@@ -409,6 +537,8 @@ static inline fault_t* read_uffd_fault()
             pagefault_index, this_page, addr, pc,
             prev_pc_snapshot, prev_delta_snapshot, trace_last_delta);
         stack_scan(pc);
+        stack_anchors(((unsigned long) message.reserved2 << 32) | message.reserved3,
+            this_page);
 #endif
         log_debug("uffd pagefault event %d: addr=%llx, flags=0x%llx",
             message.event, addr, flags);
