@@ -18,6 +18,8 @@ import multiprocessing
 import os
 import pickle
 import tempfile
+import numpy as np
+import pystreed.binarizer
 from pystreed import STreeDClassifier
 from preprocessing import load_and_filter_data
 from sklearn.model_selection import train_test_split
@@ -49,6 +51,39 @@ from pystreed_to_c import convert_tree_to_c_code, walk_tree, tree_to_boxes, deno
 # 555555555b82's 2.9M-row spatial dataset). A file has no such size limit;
 # the parent only reads it after p.join() confirms the child is done.
 _RESULT_PATH = os.path.join(tempfile.gettempdir(), f"single_tree_worker_result_{os.getpid()}.pkl")
+
+# pystreed's default binarizer puts 5 quantile thresholds on every continuous
+# feature, so a narrow exact rule like "Offset_from_faulting in [-2, -1]" (the
+# quicklistNode next pointer sitting 1-2 slots from the faulting slot on
+# DiLOS Redis LRANGE: 100% precise, ~55% recall) can't be expressed - the
+# nearest cutpoints were -97 and -1. ST_EXACT_OFFSETS=K (gen_single_tree_code.py
+# --exact_offsets K) adds a cutpoint at every half-integer in [-K-0.5, K+0.5]
+# for these slot-offset features, on top of the quantile ones.
+_EXACT_OFFSET_FEATURES = ('Offset_from_faulting', 'Delta')
+
+
+class _ExactOffsetBinarizer(pystreed.binarizer.KThresholdBinarizer):
+    def fit(self, X, y=None):
+        super().fit(X, y)
+        k = int(os.environ.get("ST_EXACT_OFFSETS", "0"))
+        if k <= 0:
+            return self
+        names = list(getattr(self, "feature_names_in_", []))
+        for jj, name in enumerate(names):
+            if name not in _EXACT_OFFSET_FEATURES:
+                continue
+            column = np.asarray(X)[:, jj]
+            col_min, col_max = column.min(), column.max()
+            extra = [c + 0.5 for c in range(-k - 1, k + 1) if col_min <= c + 0.5 < col_max]
+            cutpoints = sorted(set(float(c) for c in self.thresholds_[jj]) | set(extra))
+            self.thresholds_[jj] = cutpoints
+            self.n_thresholds_[jj] = len(cutpoints)
+            self.column_names_[jj] = [f"{name} <= {c}" for c in cutpoints]
+        return self
+
+
+# Binarizer.fit looks KThresholdBinarizer up in its module at call time
+pystreed.binarizer.KThresholdBinarizer = _ExactOffsetBinarizer
 
 
 def _fit_and_convert_worker(pc, X, y, category, feature_normalization_cache, result_path,

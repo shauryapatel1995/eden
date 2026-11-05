@@ -63,7 +63,13 @@ if __name__ == "__main__":
                         help="emit integer box bounds and no floating point (for the kernel module)")
     parser.add_argument("--f_beta", type=float, default=1.0,
                         help="Beta for F-beta score (0.5 = precision-weighted, 1.0 = F1, 2.0 = recall-weighted)")
+    parser.add_argument("--exact_offsets", type=int, default=0,
+                        help="also give Offset_from_faulting and Delta a threshold at every integer "
+                             "in [-K, K], on top of the quantile ones (0 = quantile only)")
     args = parser.parse_args()
+    if args.exact_offsets:
+        # read by main.py's binarizer patch, inside its training subprocesses
+        os.environ["ST_EXACT_OFFSETS"] = str(args.exact_offsets)
     if args.integer_bounds:
         # read by pystreed_to_c.py, including in main.py's training subprocesses
         os.environ["ST_INTEGER_BOUNDS"] = "1"
