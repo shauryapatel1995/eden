@@ -190,16 +190,17 @@ static void stack_scan(unsigned long pc)
  * within +-64 bytes of the target (same page) whose value falls on the
  * faulting page:
  *   "Stk: soff, stack_addr, target, rel"   rel = matching slot - target, bytes
- * one line per matching (word, slot); then, once per distinct target page,
- * that page's pointer contents (slots pointing into any uffd region, present
- * or not, so links to resident objects are kept too):
- *   "StkPg: page, idx, val: v, present:p"  idx = 8-byte slot index in page
+ * one line per matching (word, slot); then, once per distinct target, the
+ * pointer slots within the same +-64 bytes of it (slots pointing into any
+ * uffd region, present or not, so links to resident objects are kept too):
+ *   "StkObj: target, rel, val: v, present:p"  rel = slot - target, bytes
+ * (dumping the whole target page was ~128 lines per anchored fault on Redis)
  * Separate lines rather than extra PF-line fields because DataClasses.Trace
  * parses the PF line from its end; tags avoid "Loc:", which
  * process_linux_trace.py substring-matches for faulting-page pointers. */
 #define SA_MAX_WORDS    1024        /* scan at most 8KB above SP */
 #define SA_REL_BYTES    64
-#define SA_MAX_PAGES    64
+#define SA_MAX_TARGETS  64
 #define SA_NRANGES      16
 static int sa_enabled = -1;
 static struct { unsigned long lo, hi; } sa_ranges[SA_NRANGES];
@@ -256,9 +257,9 @@ static bool sa_lock_present(struct region_t *mr, unsigned long page)
 
 static void stack_anchors(unsigned long sp, unsigned long fault_page)
 {
-    unsigned long end, val, page, dumped[SA_MAX_PAGES];
+    unsigned long end, val, page, dumped[SA_MAX_TARGETS];
     unsigned long *stack = (unsigned long *) sp, *slot, *p;
-    int nwords, ndumped = 0, soff, j, k, rel;
+    int nwords, ndumped = 0, soff, k, rel;
     struct region_t *mr, *vmr;
     pgflags_t oldflags;
     bool matched;
@@ -292,16 +293,18 @@ static void stack_anchors(unsigned long sp, unsigned long fault_page)
             }
         }
         if (matched) {
-            for (k = 0; k < ndumped && dumped[k] != page; k++)
+            for (k = 0; k < ndumped && dumped[k] != val; k++)
                 ;
-            if (k == ndumped && ndumped < SA_MAX_PAGES) {
-                dumped[ndumped++] = page;
-                p = (unsigned long *) page;
-                for (j = 0; j < CHUNK_SIZE / 8; j++) {
-                    if (!p[j] || !(vmr = get_region_by_addr_unsafe(p[j] & ~CHUNK_MASK)))
+            if (k == ndumped && ndumped < SA_MAX_TARGETS) {
+                dumped[ndumped++] = val;
+                for (rel = -SA_REL_BYTES; rel <= SA_REL_BYTES; rel += 8) {
+                    p = (unsigned long *) ((unsigned long) slot + rel);
+                    if ((unsigned long) p < page || (unsigned long) p >= page + CHUNK_SIZE)
                         continue;
-                    fprintf(stderr, "StkPg: %lx, %d, val: %lx, present:%d\n", page, j,
-                        p[j], !!(get_page_flags(vmr, p[j] & ~CHUNK_MASK) & PFLAG_PRESENT));
+                    if (!*p || !(vmr = get_region_by_addr_unsafe(*p & ~CHUNK_MASK)))
+                        continue;
+                    fprintf(stderr, "StkObj: %lx, %d, val: %lx, present:%d\n", val, rel,
+                        *p, !!(get_page_flags(vmr, *p & ~CHUNK_MASK) & PFLAG_PRESENT));
                 }
             }
         }
