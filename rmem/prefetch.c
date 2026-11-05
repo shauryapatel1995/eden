@@ -61,11 +61,15 @@ static int prefetch_act(fault_t *f, int chan_id, uint64_t *compact_ptr_val,
                 clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
                 continue;
             }
+            /* marked before posting so a fault racing the completion
+             * still sees it (see prefetch_fault_seen() in fault.c) */
+            set_page_flags(f->mr, ptr_val, PFLAG_PREFETCHED, &oldflags);
             if (rmbackend->post_read_prefetch(chan_id, f, ptr_val, bkend_buf)) {
                 /* backend busy; stop trying more candidates for this
                  * fault, it'll likely still be busy for the rest */
                 bkend_buf_free(bkend_buf);
-                clear_page_flags(f->mr, ptr_val, PFLAG_WORK_ONGOING, &oldflags);
+                clear_page_flags(f->mr, ptr_val,
+                    PFLAG_WORK_ONGOING | PFLAG_PREFETCHED, &oldflags);
                 RSTAT(PREFETCH_BACKEND_BUSY)++;
                 stop_early = true;
                 continue;

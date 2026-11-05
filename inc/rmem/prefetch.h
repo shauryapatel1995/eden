@@ -54,5 +54,8 @@ int single_tree_pointer_candidates(uint64_t pc, uint64_t prev_pc, double prev_de
 #endif
 /* Leap baseline (DO_PREFETCH_LEAP) - see rmem/prefetch_leap.c */
 void page_prefetch_leap(fault_t *f, int chan_id);
+/* Redis quicklist stack-walk prefetcher (DO_PREFETCH_STACKWALK) - see
+ * rmem/prefetch_stackwalk.c */
+void page_prefetch_stackwalk(fault_t *f, int chan_id);
 
 #endif // __PREFETCH_H

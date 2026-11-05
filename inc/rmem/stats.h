@@ -78,6 +78,22 @@ enum {
                                           * pointer stage actually read (only
                                           * those its tree could predict
                                           * positive), out of 512 per fault */
+    RSTAT_PREFETCH_FAULT_INFLIGHT,      /* faults that found their page
+                                          * still locked by an in-flight
+                                          * predictor prefetch (late
+                                          * prefetch: the fault waits for it
+                                          * instead of reading on its own) */
+    RSTAT_PREFETCH_FAULT_INFLIGHT_WAIT_CYCLES, /* app wait of those faults,
+                                          * from fault creation to resolution */
+    RSTAT_PREFETCH_FAULT_ARRIVED,       /* faults on a prefetched page whose
+                                          * read had already completed (write
+                                          * to the wrprotected copy, or a fault
+                                          * raised before but handled after
+                                          * completion) */
+    RSTAT_PREFETCH_EVICT_UNFAULTED,     /* prefetched pages evicted without
+                                          * any fault on them since: either
+                                          * only read (a true hit, which can't
+                                          * fault) or never touched */
     RSTAT_LEAP_PREFETCHES,              /* Leap baseline (DO_PREFETCH_LEAP):
                                           * prefetch reads posted */
     RSTAT_LEAP_HITS,                    /* prefetched pages the app moved
@@ -86,6 +102,19 @@ enum {
     RSTAT_LEAP_TREND_FOUND,             /* faults with a majority stride */
     RSTAT_LEAP_NO_TREND,                /* faults that fell back to
                                           * sequential readahead */
+    RSTAT_STACKWALK_CALLS,              /* stack-walk prefetcher
+                                          * (DO_PREFETCH_STACKWALK): faults
+                                          * that tried it (had an SP) */
+    RSTAT_STACKWALK_ANCHORED,           /* ... that found the node whose
+                                          * ziplist holds the faulting page */
+    RSTAT_STACKWALK_NODES_READ,         /* list nodes read (anchor search
+                                          * and walk) */
+    RSTAT_STACKWALK_DEPTH_SUM,          /* nodes walked past the anchor,
+                                          * summed (mean depth reached) */
+    RSTAT_STACKWALK_STOP_REMOTE,        /* walks stopped at a node page that
+                                          * wasn't resident (prefetched it) */
+    RSTAT_STACKWALK_STOP_END,           /* walks stopped at the list end */
+    RSTAT_STACKWALK_PREFETCHES,         /* prefetch reads posted */
 
     /* eviction stats */
     RSTAT_EVICTS,
@@ -168,6 +197,8 @@ enum {
     RSTAT_LEAP_DECIDE_CYCLES,   /* Leap: hit inference, history, trend and
                                   * window per fault (its "inference") */
     RSTAT_LEAP_ACT_CYCLES,      /* Leap: gating and posting its prefetches */
+    RSTAT_STACKWALK_CYCLES,     /* stack walk: anchor search, node walk,
+                                  * gating and posting, per fault, summed */
     RSTAT_HANDLE_FAULT_CYCLES,  /* total handler-thread time spent inside
                                   * handle_page_fault() across every call
                                   * (fresh faults and wait-queue re-checks

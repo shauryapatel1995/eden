@@ -33,10 +33,21 @@ const char *rstat_names[] = {
     "prefetch_spatial_no_model_skips",
     "prefetch_zero_page_skips",
     "prefetch_slots_read",
+    "prefetch_fault_inflight",
+    "prefetch_fault_inflight_wait_cycles",
+    "prefetch_fault_arrived",
+    "prefetch_evict_unfaulted",
     "leap_prefetches",
     "leap_hits",
     "leap_trend_found",
     "leap_no_trend",
+    "stackwalk_calls",
+    "stackwalk_anchored",
+    "stackwalk_nodes_read",
+    "stackwalk_depth_sum",
+    "stackwalk_stop_remote",
+    "stackwalk_stop_end",
+    "stackwalk_prefetches",
 
     /* eviction stats */
     "evict_ops",
@@ -80,6 +91,7 @@ const char *rstat_names[] = {
 	"prefetch_spatial_act_cycles",
 	"leap_decide_cycles",
 	"leap_act_cycles",
+	"stackwalk_cycles",
 	"handle_fault_cycles",
 
 	/* rmem hints */

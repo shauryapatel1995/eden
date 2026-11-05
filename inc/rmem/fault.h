@@ -37,7 +37,9 @@ typedef struct fault {
     uint8_t rdahead;            /* actual read-ahead locked for this fault */
     uint8_t evict_prio;         /* suggested eviction priority for the page */
     uint8_t posted_chan_id;
-    uint8_t unused2[3];
+    uint8_t pf_inflight;        /* first saw its page locked by an in-flight
+                                 * prefetch (PREFETCH_FAULT_INFLIGHT) */
+    uint8_t unused2[2];
 
     /* associated resources */
     unsigned long page;
@@ -51,6 +53,8 @@ typedef struct fault {
                                   * fields like this behind DO_PREFETCH) */
     int64_t prev_delta;         /* page-address delta between the 2nd-to-last
                                   * and last real fault (used by prefetcher) */
+    uint64_t sp;                /* faulting thread's user SP (0 if the kernel
+                                  * doesn't report it; see handler.c) */
     struct region_t* mr;
     thread_t* thread;
     void* bkend_buf;
@@ -60,7 +64,7 @@ typedef struct fault {
                                  * blocks on real (from_kernel) page faults */
 
 	struct list_node link;
-    uint8_t cacheline_padding[128 - 104]; /* pad fault_t to 2 cache lines */
+    uint8_t cacheline_padding[128 - 112]; /* pad fault_t to 2 cache lines */
 } fault_t;
 BUILD_ASSERT(sizeof(fault_t) % CACHE_LINE_SIZE == 0);
 BUILD_ASSERT(FAULT_MAX_RDAHEAD_SIZE <= UINT8_MAX);   /* due to rdahead */

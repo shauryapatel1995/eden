@@ -244,6 +244,14 @@ endif
 CFLAGS += -DDO_PREFETCH_LEAP
 endif
 
+# Redis quicklist depth-walk prefetcher from the faulting thread's stack
+# (opt-in: make fltrace.so DO_PREFETCH_STACKWALK=1, alone or with DO_PREFETCH=1
+# for the spatial tree). Needs the 5.16.0-uffdsp+ kernel (SP in uffd_msg);
+# see rmem/prefetch_stackwalk.c.
+ifneq ($(DO_PREFETCH_STACKWALK),)
+CFLAGS += -DDO_PREFETCH_STACKWALK
+endif
+
 # raw pc/pointer-content tracing for collecting prefetcher training data
 # (opt-in: make fltrace.so DO_TRACING=1). dumps one line per fault with its
 # page address, faulting address and pc, plus one line per nonzero pointer
