@@ -341,6 +341,7 @@ static inline void fault_serve_zero_pages(fault_t* f, int nchunks)
     /* done */
     log_debug("%s - added %d zero pages", FSTR(f), nchunks);
     RSTAT(FAULTS_ZP)++;
+    f->zero_page = 1;
 }
 
 /* Called after a prefetched page is read from the backend. Takes mr/prio
@@ -435,15 +436,24 @@ void fault_done(fault_t* f, int chan_id, int *nevicts_needed)
     unsigned long postfetch_start_tsc;
 #endif
 
-#ifdef DO_PREFETCH
+#if defined(DO_PREFETCH) || defined(DO_PREFETCH_LEAP)
     /* bump once per real fault serviced, before this fault's own prefetches
      * (if any) get staged - see prefetch_fault_counter in common.h */
     atomic64_add_and_fetch(&prefetch_fault_counter, 1);
+#endif
 
+#ifdef DO_PREFETCH
     /* speculatively prefetch pointer-chase candidates off the page we just
      * finished servicing, before releasing its lock. this runs on the
      * single handler thread, which can't poll for the next real uffd
      * fault while it's in here - see RSTAT_PREFETCH_SCAN_CYCLES */
+    /* a first-touch fault was just served an all-zero page: there are no
+     * pointers on it to chase (and the tracing build dumps no candidates
+     * for such pages either, so the models never saw them) */
+    if (f->zero_page) {
+        RSTAT(PREFETCH_ZERO_PAGE_SKIPS)++;
+        goto postfetch_done;
+    }
     postfetch_start_tsc = rdtsc();
 #ifdef DO_FAULT_TIMING
     struct timespec __pf_ts1, __pf_ts2;
@@ -462,6 +472,7 @@ void fault_done(fault_t* f, int chan_id, int *nevicts_needed)
     }
 #endif
     RSTAT(PREFETCH_SCAN_CYCLES) += rdtsc() - postfetch_start_tsc;
+postfetch_done: ;
 #endif
 
 #ifdef DO_TRACING
@@ -531,6 +542,27 @@ void fault_done(fault_t* f, int chan_id, int *nevicts_needed)
     fault_free(f);
 }
 
+/* A fault reached a page that a predictor prefetch brought in (or still
+ * has in flight - see PREFETCH_FAULT_INFLIGHT below): count it once and
+ * unmark the page, so a later fault on it after eviction isn't blamed on
+ * this prefetch. flags are the page's flags as the caller last saw them */
+static inline void prefetch_fault_seen(fault_t *f, pgflags_t flags)
+{
+    pgflags_t oldflags;
+
+    if (f->pf_inflight) {
+        /* resolved by the in-flight prefetch it was waiting on */
+        if (f->from_kernel)
+            RSTAT(PREFETCH_FAULT_INFLIGHT_WAIT_CYCLES) += rdtsc() - f->create_tsc;
+        f->pf_inflight = 0;
+    } else if (flags & PFLAG_PREFETCHED) {
+        RSTAT(PREFETCH_FAULT_ARRIVED)++;
+    } else {
+        return;
+    }
+    clear_page_flags(f->mr, f->page, PFLAG_PREFETCHED, &oldflags);
+}
+
 /* Gateway to common fault handling for shenango or handler cores after 
  * receiving a page fault */
 enum fault_status handle_page_fault(int chan_id, fault_t* fault, 
@@ -558,6 +590,7 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
         fault->uffd_explicit_wake = fault->from_kernel;
         log_debug("%s - fault done, was redundant", FSTR(fault));
         RSTAT(FAULTS_REDUNDANT)++;
+        prefetch_fault_seen(fault, get_page_flags(fault->mr, fault->page));
         if (fault->from_kernel)
             RSTAT(APP_FAULT_WAIT_CYCLES) += rdtsc() - fault->create_tsc;
         return FAULT_DONE;
@@ -570,6 +603,12 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
         pflags = set_page_flags(mr, fault->page, PFLAG_WORK_ONGOING, &oldflags);
         was_locked = !!(oldflags & PFLAG_WORK_ONGOING);
         if (unlikely(was_locked)) {
+            /* a late prefetch: the page's read is in flight, so this fault
+             * waits for it (counted once, on first sight) */
+            if ((oldflags & PFLAG_PREFETCHED) && !fault->pf_inflight) {
+                RSTAT(PREFETCH_FAULT_INFLIGHT)++;
+                fault->pf_inflight = 1;
+            }
             /* someone else is working on it, check back later */
             log_debug("%s - saw ongoing work, going to wait", FSTR(fault));
             return FAULT_IN_PROGRESS;
@@ -583,6 +622,7 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
             /* see if the fault got serviced during the locking */
             if (unlikely(is_fault_serviced(fault, /*locked=*/ true))) {
                 /* same as the unlocked redundant check above */
+                prefetch_fault_seen(fault, pflags);
                 fault->uffd_explicit_wake = fault->from_kernel;
                 log_debug("%s - fault done, was redundant", FSTR(fault));
                 if (fault->from_kernel)
@@ -636,6 +676,7 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
              * just in case! */
             page_present = !!(pflags & PFLAG_PRESENT);
             if (page_present) {
+                prefetch_fault_seen(fault, pflags);
                 wrprotect = (fault->is_wrprotect | fault->is_write);
                 no_wake = fault->from_kernel ? false : true;
 
@@ -745,6 +786,16 @@ enum fault_status handle_page_fault(int chan_id, fault_t* fault,
              * this fault before fault_done() runs, so accessing it here is
              * safe; see page_prefetch_spatial() in prefetch.c) */
             page_prefetch_spatial(fault, chan_id);
+#endif
+#ifdef DO_PREFETCH_LEAP
+            /* Leap baseline: address-only, so it runs at the same point */
+            page_prefetch_leap(fault, chan_id);
+#endif
+#ifdef DO_PREFETCH_STACKWALK
+            /* Redis quicklist depth walk from the faulting thread's stack
+             * (see prefetch_stackwalk.c): also needs nothing from this
+             * fault's page, so its reads go out while this one is in flight */
+            page_prefetch_stackwalk(fault, chan_id);
 #endif
 
             status = FAULT_READ_POSTED;

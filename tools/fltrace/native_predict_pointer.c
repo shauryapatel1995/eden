@@ -18,7 +18,7 @@
  * libxgboost path, this can't load a different model file at runtime.
  */
 
-#ifdef DO_PREFETCH
+#if defined(DO_PREFETCH) && !defined(DO_PREFETCH_SINGLE_TREE)
 
 #include <stdint.h>
 #include <stdbool.h>

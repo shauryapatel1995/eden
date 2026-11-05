@@ -839,8 +839,13 @@ static inline void evict_page_done(struct region_t* mr, unsigned long pgaddr,
     /* assert locked */
     assert(!!(get_page_flags(mr, pgaddr) & PFLAG_WORK_ONGOING));
 
+    /* a prefetched page leaving without ever having faulted since */
+    if (get_page_flags(mr, pgaddr) & PFLAG_PREFETCHED)
+        RSTAT(PREFETCH_EVICT_UNFAULTED)++;
+
     /* bits to clear */
     clrbits = 0;
+    clrbits |= PFLAG_PREFETCHED;
     clrbits |= PFLAG_EVICT_ONGOING;
     clrbits |= PFLAG_PRESENT;
     clrbits |= PFLAG_DIRTY;

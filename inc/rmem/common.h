@@ -36,6 +36,20 @@ extern bool rmem_inited;
  * DO_PREFETCH-gated. */
 extern atomic64_t prefetch_fault_counter;
 
+#ifdef DO_IDEAL_PREFETCH_SIM
+/* idealized-prefetcher simulation (opt-in: make fltrace.so
+ * DO_IDEAL_PREFETCH_SIM=1) - see local_post_read() in rmem_local.c. Every
+ * 8th real local-backend read pays ideal_prefetch_delay_us (plus a static
+ * 4us page-copy cost, IDEAL_PREFETCH_READ_DELAY_US in rmem_local.c) of injected
+ * busy-wait latency (simulating an un-prefetched page needing a real RDMA
+ * round trip); the other 7 pay nothing (simulating pages a perfect
+ * prefetcher already fetched for free). Set via FLTRACE_IDEAL_PREFETCH_DELAY_US
+ * (microseconds, 0 = disabled) - a runtime knob rather than a compile-time
+ * one so a delay sweep doesn't require rebuilding fltrace.so per point. */
+extern uint64_t ideal_prefetch_delay_us;
+extern atomic64_t ideal_prefetch_read_counter;
+#endif
+
 /* thread-local */
 extern __thread pgthread_t current_kthread_id;
 extern __thread bool __from_runtime;

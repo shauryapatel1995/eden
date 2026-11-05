@@ -29,6 +29,8 @@ enum {
     PSHIFT_EVICT_ONGOING,       /* page is being evicted */
     PSHIFT_ACCESSED,            /* page was accessed again after the fault */
     PSHIFT_PRESENT_ZERO_PAGED,  /* page currently mapped due to first access */
+    PSHIFT_PREFETCHED,          /* brought in (or in flight) by a predictor
+                                 * prefetch, not faulted on since */
     PAGE_FLAGS_NUM
 };
 BUILD_ASSERT(PAGE_FLAGS_NUM <= sizeof(pgflags_t) * 8);
@@ -39,6 +41,7 @@ BUILD_ASSERT(PAGE_FLAGS_NUM <= sizeof(pgflags_t) * 8);
 #define PFLAG_EVICT_ONGOING         (1u << PSHIFT_EVICT_ONGOING)
 #define PFLAG_ACCESSED              (1u << PSHIFT_ACCESSED)
 #define PFLAG_PRESENT_ZERO_PAGED    (1u << PSHIFT_PRESENT_ZERO_PAGED)
+#define PFLAG_PREFETCHED            (1u << PSHIFT_PREFETCHED)
 #define PAGE_FLAGS_MASK             ((1u << PAGE_FLAGS_NUM) - 1)
 
 /* 2. Page thread id (offset and mask) */

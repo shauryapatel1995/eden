@@ -8,7 +8,7 @@
  * ratios) rather than one shared model.
  */
 
-#ifdef DO_PREFETCH
+#if defined(DO_PREFETCH) && !defined(DO_PREFETCH_SINGLE_TREE)
 
 #include <stdint.h>
 #include <stdbool.h>

@@ -9,13 +9,20 @@
 #include <string.h>
 #include <sys/mman.h>
 
+#include "base/atomic.h"
 #include "base/time.h"
 #include "rmem/backend.h"
+#include "rmem/common.h"
 #include "rmem/fault.h"
 #include "rmem/page.h"
 #include "rmem/stats.h"
 
 #define LOCAL_BACKEND_DELAY_MUS 0
+#ifdef DO_IDEAL_PREFETCH_SIM
+/* static page-copy (memcpy) cost added to each delayed (1-in-8) read on
+ * top of ideal_prefetch_delay_us - see local_post_read() */
+#define IDEAL_PREFETCH_READ_DELAY_US 4
+#endif
 #define PAGE_LOCKS_SHIFT    16
 #define PAGE_LOCKS_SIZE     (1 << PAGE_LOCKS_SHIFT)
 #define PAGE_LOCKS_MASK     (PAGE_LOCKS_SIZE-1)
@@ -48,6 +55,16 @@ struct local_completion {
     int req_idx;
     enum req_mode_t rwmode;
     unsigned long posted_tsc;
+#ifdef DO_IDEAL_PREFETCH_SIM
+    /* per-completion artificial delay (microseconds) - see
+     * ideal_prefetch_delay_us in common.h. Stored per-slot rather than as
+     * one global constant (the old LOCAL_BACKEND_DELAY_MUS) since only 1 in
+     * every 8 real reads should pay it; a fixed slot in the cq[] ring
+     * buffer gets reused by whichever request posts next, so this must be
+     * explicitly set (including to 0) at every post site, not left to
+     * stale leftover data from a previous occupant. */
+    unsigned long delay_us;
+#endif
 };
 
 struct local_channel {
@@ -248,6 +265,9 @@ int local_post_read_prefetch(int chan_id, fault_t *f,
     chan->cq[cq_id].req_idx = req_id;
     chan->cq[cq_id].rwmode = PREFETCH;
     chan->cq[cq_id].posted_tsc = rdtsc();
+#ifdef DO_IDEAL_PREFETCH_SIM
+    chan->cq[cq_id].delay_us = 0;   /* only local_post_read()'s real-fault reads get delayed */
+#endif
     store_release(&chan->cq[cq_id].busy, 1);
     log_debug("%s - posted prefetch cq %d on chan %d", FSTR(f), cq_id, chan_id);
 
@@ -331,6 +351,24 @@ int local_post_read(int chan_id, fault_t* f)
     chan->cq[cq_id].req_idx = req_id;
     chan->cq[cq_id].rwmode = READ;
     chan->cq[cq_id].posted_tsc = rdtsc();
+#ifdef DO_IDEAL_PREFETCH_SIM
+    /* idealized-prefetcher simulation: exactly 1 in every 8 real-fault
+     * reads pays ideal_prefetch_delay_us (simulating the one page an ideal
+     * prefetcher didn't have time to fetch ahead of need), the other 7 pay
+     * nothing (simulating pages it already fetched for free) - see
+     * ideal_prefetch_delay_us's comment in common.h. idx 0 (the very first
+     * real read) is deliberately delayed too, matching a cold start where
+     * nothing has been prefetched yet. The delayed read also pays a static
+     * IDEAL_PREFETCH_READ_DELAY_US for the page copy itself; prefetched
+     * (free) pages pay neither. */
+    chan->cq[cq_id].delay_us = 0;
+    if (ideal_prefetch_delay_us) {
+        long idx = atomic64_fetch_and_add(&ideal_prefetch_read_counter, 1);
+        if (idx % 8 == 0)
+            chan->cq[cq_id].delay_us = ideal_prefetch_delay_us
+                + IDEAL_PREFETCH_READ_DELAY_US;
+    }
+#endif
     store_release(&chan->cq[cq_id].busy, 1);
     log_debug("%s - posted cq %d on chan %d", FSTR(f), cq_id, chan_id);
 
@@ -421,6 +459,9 @@ int local_post_write(int chan_id, struct region_t* mr, unsigned long addr,
     chan->cq[cq_id].req_idx = req_id;
     chan->cq[cq_id].rwmode = WRITE;
     chan->cq[cq_id].posted_tsc = rdtsc();
+#ifdef DO_IDEAL_PREFETCH_SIM
+    chan->cq[cq_id].delay_us = 0;   /* only local_post_read()'s real-fault reads get delayed */
+#endif
     store_release(&chan->cq[cq_id].busy, 1);
     log_debug("posted cq %d for %lx on chan %d", cq_id, addr, chan_id);
 
@@ -482,7 +523,11 @@ int local_check_cq(int chan_id, struct bkend_completion_cbs* cbs, int max_cqe,
 
         /* check artificial delay: is it time yet? */
         duration_tsc = rdtscp(NULL) - cq[cq_id].posted_tsc;
+#ifdef DO_IDEAL_PREFETCH_SIM
+        if (duration_tsc < cycles_per_us * cq[cq_id].delay_us)
+#else
         if (duration_tsc < cycles_per_us * LOCAL_BACKEND_DELAY_MUS)
+#endif
             break;
 
         /* copy completion to local buf. NOTE: mind the shallow copy */
