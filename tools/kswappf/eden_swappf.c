@@ -20,7 +20,15 @@
  *                2 = read only the faulting page (no-prefetch baseline)
  *   target_tgid  the process to act on; every other process gets the
  *                kernel's own read-ahead
- * Counters (read-only): faults, model_faults, predicted_pages.
+ *   next_n       mode 1: pages +1..+next_n asked of the trees (default 4;
+ *                set it to the PF_SPATIAL_N the trees were trained with)
+ *   direct_map   mode 1: 0 = predicted pages only go into the swap cache
+ *                (their first access takes a minor fault), 1 = the fault also
+ *                maps them into the page table, waiting for their reads,
+ *                2 = a kernel worker maps them once their reads complete
+ * Counters (read-only): faults, model_faults, predicted_pages; mapped_pages
+ * and map_skipped (pages the kernel mapped directly / read for mapping but
+ * left unmapped, all processes, since boot).
  */
 #include <linux/module.h>
 #include <linux/mm.h>
@@ -46,6 +54,14 @@ static int target_tgid;
 module_param(target_tgid, int, 0644);
 MODULE_PARM_DESC(target_tgid, "process (tgid) to act on");
 
+static int next_n = 4;
+module_param(next_n, int, 0644);
+MODULE_PARM_DESC(next_n, "mode 1: deltas +1..+next_n asked of the trees (1..64; match the training window)");
+
+static int direct_map;
+module_param(direct_map, int, 0644);
+MODULE_PARM_DESC(direct_map, "mode 1: 0 = swap cache only, 1 = also map (sync), 2 = also map (async worker)");
+
 static atomic64_t faults = ATOMIC64_INIT(0);		/* target swap-in faults seen */
 static atomic64_t model_faults = ATOMIC64_INIT(0);	/* ... whose PC has a tree */
 static atomic64_t predicted_pages = ATOMIC64_INIT(0);	/* pages asked for */
@@ -59,6 +75,14 @@ module_param_cb(faults, &counter_ops, &faults, 0444);
 module_param_cb(model_faults, &counter_ops, &model_faults, 0444);
 module_param_cb(predicted_pages, &counter_ops, &predicted_pages, 0444);
 
+static int get_long_counter(char *buf, const struct kernel_param *kp)
+{
+	return sysfs_emit(buf, "%ld\n", atomic_long_read((atomic_long_t *)kp->arg));
+}
+static const struct kernel_param_ops long_counter_ops = { .get = get_long_counter };
+module_param_cb(mapped_pages, &long_counter_ops, &swap_pf_mapped_pages, 0444);
+module_param_cb(map_skipped, &long_counter_ops, &swap_pf_map_skipped, 0444);
+
 /* history features over the target's swap-in faults (one target process) */
 static DEFINE_SPINLOCK(hist_lock);
 static int hist_tgid;
@@ -70,7 +94,7 @@ static bool eden_predict(struct vm_fault *vmf, struct swap_prefetch_req *req)
 {
 	unsigned long pc, page, prev_pc;
 	long prev_delta;
-	int fl, k, m = mode;
+	int fl, k, n, m = mode;
 	st_model_t model;
 	uint32_t active;
 
@@ -103,10 +127,12 @@ static bool eden_predict(struct vm_fault *vmf, struct swap_prefetch_req *req)
 		return true;			/* no tree: just the faulting page */
 	atomic64_inc(&model_faults);
 	active = model.fault(pc, prev_pc, prev_delta);
-	for (k = 1; active && k <= 4; k++)
+	n = clamp(READ_ONCE(next_n), 1, 64);
+	for (k = 1; active && k <= n; k++)
 		if (st_predict(&model, active, -1, -1 - fl, k))
 			req->fwd |= 1ULL << (k - 1);
 	atomic64_add(hweight64(req->fwd), &predicted_pages);
+	req->map = clamp(READ_ONCE(direct_map), SWAP_PF_MAP_NONE, SWAP_PF_MAP_ASYNC);
 	return true;
 }
 
