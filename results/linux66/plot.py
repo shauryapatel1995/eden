@@ -21,10 +21,10 @@ CSV = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "results_all.csv"
 # neo4j, xgb_py (and tao) are not reported
 WORKLOADS = ["redis", "memcached", "wiredtiger", "webservice", "dataframe",
              "mcf_ref", "cactu_ref", "xalan_ref",
-             "wt_c", "gap_pr", "gap_sssp", "lbm_ref", "memtier"]
+             "wt_c", "gap_pr", "gap_sssp", "lbm_ref", "memtier", "etc"]
 # workloads whose x label differs from the name; all of these test on different data than they trained on
 NAMES = {"wt_c": "wiredtiger\n(YCSB-C)", "gap_pr": "GAP PR\n(LJ->Twitter)",
-         "gap_sssp": "GAP SSSP\n(LJ->Twitter)", "memtier": "redis\n(memtier)"}
+         "gap_sssp": "GAP SSSP\n(LJ->Twitter)", "memtier": "redis\n(memtier)", "etc": "redis\n(ETC)"}
 # SPEC: refrate input, trees trained on the train input only
 SAME_INPUT = set()
 # claim-rule (c1) trees dropped. leapc = Leap (ATC'20) in the same module, released-code window; run on the
