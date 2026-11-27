@@ -4,24 +4,41 @@ the change against Linux default read-ahead and against no prefetching) and RESU
 (per-workload mean +- std per config)."""
 import csv, glob, os, statistics as st
 B = "/data1/shaurya/linux66_bench"
-ORDER = ["noprefetch", "default", "n4_c1", "n4_c0", "n32_c1", "n32_c0"]
+ORDER = ["noprefetch", "default", "leapc", "n4_c1", "n4_c0", "n32_c1", "n32_c0", "st_ext4"]
+EXCLUDED = ("neo4j", "tao", "xgb_py")       # not reported (user decision)
+BEST = dict(x.split(":") for x in ("cactu:n32_c0 cactu_ref:n32_c0 dataframe:n32_c0 etc:n4_c0 gap_pr:n32_c0 "
+            "gap_sssp:n32_c0 lbm_ref:n32_c0 mcf:n32_c0 mcf_ref:n32_c0 memcached:n32_c0 memtier:n4_c0 redis:n4_c0 "
+            "webservice:n4_c0 wiredtiger:n32_c0 wt_c:n32_c0 xalan:n4_c0 xalan_ref:n4_c0 redis_stack:st_ext4").split())
 DESC = {"noprefetch": "no prefetching (faulting page only)",
         "default": "Linux default read-ahead (page-cluster 3)",
         "n4_c1": "trees, N=4, claim rule on", "n4_c0": "trees, N=4, claim rule off",
-        "n32_c1": "trees, N=32, claim rule on", "n32_c0": "trees, N=32, claim rule off"}
-wls = {}; hdr = {}; rd_ = {}
+        "n32_c1": "trees, N=32, claim rule on", "n32_c0": "trees, N=32, claim rule off",
+        "leapc": "Leap (ATC'20) in the same module (mode 3): majority-trend detection over the last 32 faults, "
+                 "released-code window (hits+2, min 4, max 8 pages), aligned-block fallback without a trend",
+        "st_ext4": "stack + spatial trees (Redis LRANGE stack test)"}
+wls = {}; hdr = {}; rd_ = {}; seen_dirs = set()
 for f in sorted(glob.glob(f"{B}/wl/*.sh")):
     wl = os.path.basename(f)[:-3]
     d = [l.split("=")[1].split(";")[0] for l in open(f) if l.startswith("WL_DIR=")]
     if not d:
         continue    # shared helper sourced by workload files (e.g. tao_common.sh), not a workload
     d = d[0]
+    if wl.startswith(EXCLUDED) or d in seen_dirs:
+        continue                            # excluded, or a variant sharing another workload's directory
+    seen_dirs.add(d)
     p = f"{d}/linux66b/runs/results.csv"
-    if os.path.exists(p):
-        wls[wl] = list(csv.DictReader(open(p)))
+    pl = f"{d}/linux66b/runs_leap/results.csv"
+    rows = list(csv.DictReader(open(p))) if os.path.exists(p) else []
+    for r in (csv.DictReader(open(pl)) if os.path.exists(pl) else []):
+        # Leap baseline runs (leapc); redis_stack was run only in runs_leap (all its configs). The other
+        # runs_leap rows are same-kernel re-runs (WT, wt_c) kept out of this table.
+        if r["config"] == "leapc" or wl == "redis_stack":
+            r["_dir"] = "runs_leap"; rows.append(r)
+    if rows:
+        wls[wl] = rows
         hdr[wl] = [l[2:].rstrip() for l in open(f) if l.startswith("# ")]
         for r in wls[wl]:
-            rd = f"{d}/linux66b/runs/{r['config']}_r{r['round']}"
+            rd = f"{d}/linux66b/{r.get('_dir', 'runs')}/{r['config']}_r{r['round']}"
             rd_[id(r)] = rd
             r["run_dir"] = rd
             r["settings"] = open(f"{rd}/settings").read().strip() if os.path.exists(f"{rd}/settings") else ""
@@ -62,7 +79,26 @@ md = ["# Linux 6.6 swap prefetcher: all workloads", "",
       "xalan refrate) and are kept only for reference. The real SPEC results are `mcf_ref`, `cactu_ref` "
       "and `xalan_ref`: refrate input, trees trained only on the train-input trace "
       "(mcf/cactu trees from the train trace; xalan trees from `xalan_train`).", "",
-      "Configs: " + "; ".join(f"`{k}` = {v}" for k, v in DESC.items()), ""]
+      "Configs: " + "; ".join(f"`{k}` = {v}" for k, v in DESC.items()), "",
+      "Leap rows (`leapc`) were run on the current kernel build (Nov 25-26, 2026); the other configs come from the "
+      "October campaign (earlier builds of the same kernel). Leap's paper window (`leap`, shrinks to 0-1 pages without "
+      "hits) was 28-50% slower than read-ahead and is not reported.", "",
+      "## Summary: medians, Deku (best tree config) vs Leap and read-ahead", "",
+      "| workload | metric | read-ahead | Leap | Deku (config) | Deku vs Leap | Deku vs read-ahead | Leap vs read-ahead |",
+      "|---|---|---|---|---|---|---|---|"]
+def _med(rows, cfg):
+    v = [float(r["metric"]) for r in rows if r["config"] == cfg and r["valid"] != "FAIL" and r["metric"]]
+    return (st.median(v), len(v)) if v else (None, 0)
+def _sp(a, b, better):
+    return "-" if not a or not b else f"{(b / a if better == 'lower' else a / b):.3f}x"
+for wl, rows in wls.items():
+    better = rows[0]["better"]; cfg = BEST.get(wl)
+    (d_, nd), (l_, nl), (t_, nt) = _med(rows, "default"), _med(rows, "leapc"), _med(rows, cfg)
+    f = lambda m, n: "-" if m is None else f"{m:,.2f}" + ("" if n > 1 else "*")
+    md.append(f"| {wl} | {rows[0]['metric_name']} ({better}) | {f(d_, nd)} | {f(l_, nl)} | {f(t_, nt)} ({cfg}) | "
+              f"{_sp(t_, l_, better)} | {_sp(t_, d_, better)} | {_sp(l_, d_, better)} |")
+md += ["", "x = speedup (time: base/x; throughput: x/base); > 1 means the first-named config is better. "
+       "\\* = single run. `cactu`, `mcf`, `xalan` test on their training input (reference only).", ""]
 for wl, rows in wls.items():
     if not rows: continue
     better = rows[0]["better"]; name = rows[0]["metric_name"]
